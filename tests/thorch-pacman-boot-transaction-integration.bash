@@ -232,6 +232,7 @@ Architecture = auto
 SigLevel = Never
 LocalFileSigLevel = Never
 ParallelDownloads = 1
+DisableSandboxNetwork
 DBPath = ${install_root}/var/lib/pacman/
 CacheDir = ${install_root}/var/cache/pacman/pkg/
 LogFile = ${install_root}/var/log/pacman.log
@@ -325,6 +326,7 @@ cat > "${install_root}/etc/pacman.conf" <<'EOF'
 Architecture = auto
 SigLevel = Never
 LocalFileSigLevel = Never
+DisableSandboxNetwork
 DBPath = /var/lib/pacman/
 CacheDir = /var/cache/pacman/pkg/
 LogFile = /var/log/pacman.log
