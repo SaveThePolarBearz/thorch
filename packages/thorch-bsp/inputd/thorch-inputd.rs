@@ -157,9 +157,32 @@ fn parse_key_set(env_names: &[&str], defaults: &[&str]) -> HashSet<u16> {
     names.iter().filter_map(|name| key_code(name)).collect()
 }
 
+/// Split on whitespace, keeping double-quoted segments as single tokens.
+/// e.g. `gpio-keys "AYN Odin2 Gamepad"` -> ["gpio-keys", "AYN Odin2 Gamepad"].
+fn split_names(value: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for c in value.chars() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            c if c.is_whitespace() && !in_quotes => {
+                if !current.is_empty() {
+                    names.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        names.push(current);
+    }
+    names
+}
+
 fn parse_name_set(env_names: &[&str], defaults: &[&str]) -> HashSet<String> {
     env_value(env_names)
-        .map(|value| value.split_whitespace().map(str::to_owned).collect())
+        .map(|value| split_names(&value).into_iter().collect())
         .unwrap_or_else(|| defaults.iter().map(|value| value.to_string()).collect())
 }
 
@@ -1062,6 +1085,34 @@ mod tests {
         assert!(should_grab_on_open("gpio-keys"));
         assert!(should_grab_on_open("pmic_resin"));
         assert!(!should_grab_on_open("pmic_pwrkey"));
+    }
+
+    #[test]
+    fn parse_name_set_keeps_quoted_multi_word_names() {
+        let _guard = env_lock().lock().unwrap();
+        clear_env(&[
+            "THORCH_INPUTD_DEVICE_NAMES",
+            "THORCH_HWCONTROLD_DEVICE_NAMES",
+        ]);
+
+        env::set_var(
+            "THORCH_INPUTD_DEVICE_NAMES",
+            "gpio-keys \"AYN Odin2 Gamepad\" \"Microsoft Xbox Series S|X Controller\" bottom_touchscreen",
+        );
+
+        let config = Config::load();
+
+        assert!(config.device_names.contains("gpio-keys"));
+        assert!(config.device_names.contains("AYN Odin2 Gamepad"));
+        assert!(config.device_names.contains("Microsoft Xbox Series S|X Controller"));
+        assert!(config.device_names.contains("bottom_touchscreen"));
+        assert!(!config.device_names.contains("AYN"));
+        assert!(!config.device_names.contains("Odin2"));
+
+        clear_env(&[
+            "THORCH_INPUTD_DEVICE_NAMES",
+            "THORCH_HWCONTROLD_DEVICE_NAMES",
+        ]);
     }
 
     #[test]
