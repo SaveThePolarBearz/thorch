@@ -22,6 +22,7 @@ run_upgrade() {
 
   PATH="${work}/bin:${PATH}" \
     THORCH_INSTALL_ROOT="${work}/root" \
+    THORCH_HARDWARE_SKIP_PKEXEC=1 \
     "${BASH}" -s -- "${install_script}" "${installed_version}" <<'EOF'
 source "$1"
 

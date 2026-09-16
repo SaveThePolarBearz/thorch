@@ -14,6 +14,13 @@ fail() {
 run_fan() {
   THORCH_HARDWARE_CONFIG="${tmp}/hardware.conf" \
   THORCH_FAN_SYSFS_ROOT="${tmp}/sys" \
+  THORCH_FAN_CONFIG= \
+  THORCH_FAN_PWM_PATH= \
+  THORCH_DEVICE_PWM_FAN= \
+  DEVICE_PWM_FAN= \
+  THORCH_FAN_TEMP_SENSORS= \
+  THORCH_DEVICE_TEMP_SENSOR= \
+  DEVICE_TEMP_SENSOR= \
     "${script}" "$@"
 }
 

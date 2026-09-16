@@ -25,12 +25,16 @@ cat >"${tmp}/bin/pgrep" <<'EOF'
 #!/usr/bin/env bash
 exit 1
 EOF
+cat >"${tmp}/bin/thorch-install-fex" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
 cat >"${tmp}/home/.local/bin/thorch-start-steam-arm64" <<'EOF'
 #!/usr/bin/env bash
 exit 0
 EOF
 chmod 755 "${tmp}/bin/setsid" "${tmp}/bin/failing-supervisor" \
-  "${tmp}/bin/pgrep" \
+  "${tmp}/bin/pgrep" "${tmp}/bin/thorch-install-fex" \
   "${tmp}/home/.local/bin/thorch-start-steam-arm64"
 
 set +e
