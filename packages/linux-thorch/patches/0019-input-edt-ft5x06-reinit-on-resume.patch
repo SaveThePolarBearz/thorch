@@ -1,0 +1,85 @@
+From: Thorch contributors
+Subject: [PATCH] input: edt-ft5x06: fully re-initialize controller on resume
+
+The FT5x06 controllers on the AYN Thor come back from s2idle with a
+corrupted touch engine: the chip answers I2C and pulses its interrupt
+line, but reports no touch data. This happens even when power was
+retained through suspend (edt,retain-power-in-suspend), so the light
+register restore in the resume path is not sufficient.
+
+Re-run the probe-time initialization sequence (identify, register
+address setup, parameter readback and restore) after the power/reset
+sequencing on resume, for all controllers regardless of the
+retain-power property. The retain-power property now only skips the
+suspend-side power-off; resume always re-initializes.
+---
+--- a/Documentation/devicetree/bindings/input/touchscreen/edt-ft5x06.yaml
++++ b/Documentation/devicetree/bindings/input/touchscreen/edt-ft5x06.yaml
+@@ -63,8 +63,9 @@ properties:
+   edt,retain-power-in-suspend:
+     type: boolean
+     description:
+-      Keep the controller powered and skip suspend/resume power sequencing,
+-      without marking the interrupt as a system wake source.
++      Keep the controller powered through suspend without marking the
++      interrupt as a system wake source. The controller is still fully
++      re-initialized on resume.
+ 
+   vcc-supply: true
+   iovcc-supply: true
+--- a/drivers/input/touchscreen/edt-ft5x06.c
++++ b/drivers/input/touchscreen/edt-ft5x06.c
+@@ -1466,6 +1466,7 @@ static int edt_ft5x06_ts_resume(struct device *dev)
+ 	struct i2c_client *client = to_i2c_client(dev);
+ 	struct edt_ft5x06_ts_data *tsdata = i2c_get_clientdata(client);
++	unsigned int val;
+ 	int ret = 0;
+ 
+-	if (device_may_wakeup(dev) || tsdata->retain_power_in_suspend)
++	if (device_may_wakeup(dev))
+ 		return 0;
+@@ -1475,6 +1476,14 @@ static int edt_ft5x06_ts_resume(struct device *dev)
+ 	if (tsdata->suspend_mode == EDT_PMODE_POWEROFF) {
+ 		struct gpio_desc *reset_gpio = tsdata->reset_gpio;
+ 
++		/*
++		 * The suspend path leaves the IRQ enabled when power was
++		 * retained (edt,retain-power-in-suspend); disable it here so
++		 * the re-initialization below cannot race with the ISR.
++		 */
++		if (tsdata->retain_power_in_suspend)
++			disable_irq(tsdata->client->irq);
++
+ 		/*
+ 		 * We can't check if the regulator is a dummy or a real
+ 		 * regulator. So we need to specify the 5ms reset time (T_rst)
+@@ -1504,6 +1513,28 @@ static int edt_ft5x06_ts_resume(struct device *dev)
+ 		usleep_range(1000, 2000);
+ 		gpiod_set_value_cansleep(reset_gpio, 0);
+ 		msleep(300);
+ 
+-		edt_ft5x06_restore_reg_parameters(tsdata);
++		/*
++		 * Re-run the probe-time initialization.  The FT5x06
++		 * controllers on some boards (AYN Thor) come back from s2idle
++		 * with a corrupted touch engine even after a power cycle, so
++		 * the register restore alone is not enough.
++		 */
++		ret = edt_ft5x06_ts_identify(client, tsdata);
++		if (ret) {
++			dev_err(dev, "touchscreen re-identify failed\n");
++			return ret;
++		}
++
++		/*
++		 * Dummy read access. EP0700MLP1 returns bogus data on the
++		 * first register read access and ignores writes.
++		 */
++		regmap_read(tsdata->regmap, 0x00, &val);
++
++		edt_ft5x06_ts_set_tdata_parameters(tsdata);
++		edt_ft5x06_ts_set_regs(tsdata);
++		edt_ft5x06_ts_get_defaults(&client->dev, tsdata);
++		edt_ft5x06_ts_get_parameters(tsdata);
++		edt_ft5x06_restore_reg_parameters(tsdata);
+ 		enable_irq(tsdata->client->irq);
