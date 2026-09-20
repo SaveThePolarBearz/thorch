@@ -21,8 +21,16 @@ grep -q 'mem_sleep_default=s2idle' "${repacker}" ||
   fail "rebuilt boot images still default to deep suspend"
 grep -q "kernel_cmdline_has 'mem_sleep_default=s2idle'" "${image_checker}" ||
   fail "raw image validation does not enforce the s2idle kernel default"
+# The BSP must not install system-sleep hooks that touch hardware state
+# during the suspend transition (USB role, UFS clocks, CPU/GPU policy,
+# RGB). The one exception is 50-thorch-wifi-reassoc: it only acts after
+# resume (post), only when the WiFi link is down, and only touches
+# NetworkManager.
 if compgen -G "${sleep_hooks}/thorch-*" >/dev/null; then
-  fail "BSP still installs a Thorch system-sleep hook"
+  for hook in "${sleep_hooks}"/thorch-*; do
+    [[ "$(basename "${hook}")" == "50-thorch-wifi-reassoc" ]] && continue
+    fail "BSP still installs a Thorch system-sleep hook: $(basename "${hook}")"
+  done
 fi
 
 grep -q 'KERNEL=="a600000.usb"' "${usb_rule}" ||

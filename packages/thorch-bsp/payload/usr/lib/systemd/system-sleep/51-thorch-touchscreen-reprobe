@@ -1,0 +1,43 @@
+#!/bin/bash
+# 51-thorch-touchscreen-reprobe — re-probe the edt_ft5x06 touchscreens after
+# s2idle resume.
+#
+# After s2idle the FT5x06 controllers on the Thor come back with their
+# resolution registers stuck at the 1024 power-on default (the 0019 resume
+# re-init reads them back and adopts the corrupted values), mangling touch
+# coordinates. The verified fix is a sysfs unbind/bind cycle, which re-runs
+# the full probe path and re-reads the registers fresh.
+#
+# Only acts after resume (post), only when the corruption is present
+# (debugfs num_x == 1024), and only touches the two touchscreen devices —
+# no module unload, no hardware state changes during the suspend transition.
+#
+# THORCH_TOUCH_SYSFS_ROOT overrides the sysfs root (used by tests).
+case "$1" in
+  post)
+    root="${THORCH_TOUCH_SYSFS_ROOT:-/sys}"
+    drv="${root}/bus/i2c/drivers/edt_ft5x06"
+
+    # Both touchscreens must be bound (i2c bus 1 and 4, addr 0x38).
+    if [ ! -e "${drv}/1-0038" ] || [ ! -e "${drv}/4-0038" ]; then
+      exit 0
+    fi
+
+    # Healthy resolution registers: nothing to do. If debugfs is not
+    # readable, assume the worst and re-probe anyway.
+    top_x="$(cat "${root}/kernel/debug/i2c/i2c-4/4-0038/num_x" 2>/dev/null || true)"
+    bottom_x="$(cat "${root}/kernel/debug/i2c/i2c-1/1-0038/num_x" 2>/dev/null || true)"
+    if [ -n "${top_x}" ] && [ -n "${bottom_x}" ] &&
+       [ "${top_x}" != "1024" ] && [ "${bottom_x}" != "1024" ]; then
+      exit 0
+    fi
+
+    # Corrupted (or undetectable): unbind/bind to re-probe both devices.
+    echo 1-0038 > "${drv}/unbind"
+    echo 4-0038 > "${drv}/unbind"
+    sleep "${THORCH_TOUCH_REPROBE_DELAY:-1}"
+    echo 1-0038 > "${drv}/bind"
+    echo 4-0038 > "${drv}/bind"
+    ;;
+esac
+exit 0

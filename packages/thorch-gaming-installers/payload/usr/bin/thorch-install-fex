@@ -250,7 +250,7 @@ install_rocknix_guest_freedreno() {
   local rootfs_dir="$1" rootfs_file="$2" rootfs_tree="$3" guest_lib source_lib
 
   guest_lib="${rootfs_tree}/usr/lib/libvulkan_freedreno.so"
-  source_lib="/usr/share/fex-emu/libvulkan_freedreno.so"
+  source_lib="/usr/lib/libvulkan_freedreno.so"
   [[ -d "${rootfs_tree}/usr/lib" ]] || return 0
 
   if [[ -f "${source_lib}" ]] && file "${source_lib}" | grep -q 'x86-64'; then

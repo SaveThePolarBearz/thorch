@@ -119,8 +119,16 @@ copy_path usr/share/fex-emu/AppConfig
 copy_path usr/share/fex-emu/GuestThunks
 copy_path usr/share/fex-emu/GuestThunks_32
 copy_path usr/share/fex-emu/ThunksDB.json
-copy_path usr/share/fex-emu/libvulkan_freedreno.so
 copy_path usr/config/fex-emu
+
+# ROCKNIX moved the FEX guest Vulkan driver from usr/share/fex-emu/ to
+# usr/lib/ (2026-09 nightlies). Normalize to usr/lib/ for both layouts.
+if [[ -e "${runtime_root}/usr/lib/libvulkan_freedreno.so" ]]; then
+  copy_path usr/lib/libvulkan_freedreno.so
+elif [[ -e "${runtime_root}/usr/share/fex-emu/libvulkan_freedreno.so" ]]; then
+  install -d "${dest_abs}/usr/lib"
+  rsync -a "${runtime_root}/usr/share/fex-emu/libvulkan_freedreno.so" "${dest_abs}/usr/lib/"
+fi
 
 for fmt_lib in "${runtime_root}"/usr/lib/libfmt.so.11*; do
   [[ -e "${fmt_lib}" || -L "${fmt_lib}" ]] || continue
@@ -132,7 +140,10 @@ done
 [[ -x "${dest_abs}/usr/bin/FEXRootFSFetcher" ]] || die "ROCKNIX runtime import did not produce usr/bin/FEXRootFSFetcher"
 [[ -d "${dest_abs}/usr/lib/fex-emu/HostThunks" ]] || die "ROCKNIX runtime import did not produce HostThunks"
 [[ -d "${dest_abs}/usr/share/fex-emu/GuestThunks" ]] || die "ROCKNIX runtime import did not produce GuestThunks"
-[[ -f "${dest_abs}/usr/share/fex-emu/libvulkan_freedreno.so" ]] || die "ROCKNIX runtime import did not produce the FEX guest Vulkan driver"
+[[ -f "${dest_abs}/usr/lib/libvulkan_freedreno.so" ]] || die "ROCKNIX runtime import did not produce the FEX guest Vulkan driver"
+
+fex_vulkan_source="${runtime_root}/usr/lib/libvulkan_freedreno.so"
+[[ -e "${fex_vulkan_source}" ]] || fex_vulkan_source="${runtime_root}/usr/share/fex-emu/libvulkan_freedreno.so"
 
 {
   printf 'ROCKNIX_REPO=%s\n' "${ROCKNIX_REPO}"
@@ -143,7 +154,7 @@ done
   printf 'SOURCE_FEX_ROOTFS_FETCHER=%s\n' "${runtime_root}/usr/bin/FEXRootFSFetcher"
   printf 'SOURCE_FEX_HOST_THUNKS=%s\n' "${runtime_root}/usr/lib/fex-emu/HostThunks"
   printf 'SOURCE_FEX_GUEST_THUNKS=%s\n' "${runtime_root}/usr/share/fex-emu/GuestThunks"
-  printf 'SOURCE_FEX_VULKAN_FREEDRENO=%s\n' "${runtime_root}/usr/share/fex-emu/libvulkan_freedreno.so"
+  printf 'SOURCE_FEX_VULKAN_FREEDRENO=%s\n' "${fex_vulkan_source}"
   date -u '+IMPORTED_AT=%Y-%m-%dT%H:%M:%SZ'
 } > "${dest_abs}/PROVENANCE"
 chmod 0644 "${dest_abs}/PROVENANCE"

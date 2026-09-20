@@ -1104,7 +1104,9 @@ mod tests {
 
         assert!(config.device_names.contains("gpio-keys"));
         assert!(config.device_names.contains("AYN Odin2 Gamepad"));
-        assert!(config.device_names.contains("Microsoft Xbox Series S|X Controller"));
+        assert!(config
+            .device_names
+            .contains("Microsoft Xbox Series S|X Controller"));
         assert!(config.device_names.contains("bottom_touchscreen"));
         assert!(!config.device_names.contains("AYN"));
         assert!(!config.device_names.contains("Odin2"));

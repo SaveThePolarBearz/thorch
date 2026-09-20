@@ -440,6 +440,7 @@ normalize_immutable_rocknix_image() {
     'usr/lib/libfmt.so.11*' \
     usr/bin/FEX* \
     usr/lib/fex-emu \
+    usr/lib/libvulkan_freedreno.so \
     'usr/lib/binfmt.d/FEX-*.conf' \
     usr/config/fex-emu \
     usr/share/fex-emu >/dev/null
@@ -518,7 +519,7 @@ if [[ -f "${runtime_provenance}" ]]; then
     printf 'SOURCE_ROCKNIX_IMAGE_URL=%s\n' "${image_url}"
     printf 'SOURCE_ROCKNIX_IMAGE_FILE=%s\n' "${downloaded}"
     printf 'SOURCE_ROCKNIX_SYSTEM_PAYLOAD=/SYSTEM\n'
-    printf 'SOURCE_ROCKNIX_RUNTIME_FILES=/usr/bin/FEX* /usr/lib/fex-emu /usr/share/fex-emu /usr/lib/binfmt.d/FEX-*.conf /usr/lib/libfmt.so.11*\n'
+    printf 'SOURCE_ROCKNIX_RUNTIME_FILES=/usr/bin/FEX* /usr/lib/fex-emu /usr/share/fex-emu /usr/lib/binfmt.d/FEX-*.conf /usr/lib/libfmt.so.11* /usr/lib/libvulkan_freedreno.so\n'
     [[ -z "${image_sha256}" ]] || printf 'SOURCE_ROCKNIX_IMAGE_SHA256=%s\n' "${image_sha256}"
   } >> "${runtime_provenance}"
   chmod 0644 "${runtime_provenance}"

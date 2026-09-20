@@ -2,7 +2,7 @@
 
 pkgname=thorch-fex-bin
 pkgver=2607
-pkgrel=6
+pkgrel=7
 pkgdesc='FEX-2607 binary runtime imported from the pinned ROCKNIX nightly for Thorch on AArch64'
 arch=(aarch64)
 url='https://github.com/FEX-Emu/FEX'
@@ -60,10 +60,10 @@ Run from the repository root:
 EOF
     exit 1
   fi
-  if [[ ! -f "${_runtime_dir}/usr/share/fex-emu/libvulkan_freedreno.so" ]]; then
+  if [[ ! -f "${_runtime_dir}/usr/lib/libvulkan_freedreno.so" ]]; then
     cat >&2 <<EOF
 Missing imported ROCKNIX FEX guest Vulkan driver at:
-  ${_runtime_dir}/usr/share/fex-emu/libvulkan_freedreno.so
+  ${_runtime_dir}/usr/lib/libvulkan_freedreno.so
 
 Run from the repository root:
   ./scripts/sync-rocknix-kernel.sh
@@ -94,11 +94,16 @@ EOF
   fi
 
   install -d "${pkgdir}/usr/share/fex-emu"
-  for rel in AppConfig GuestThunks GuestThunks_32 ThunksDB.json libvulkan_freedreno.so; do
+  for rel in AppConfig GuestThunks GuestThunks_32 ThunksDB.json; do
     if [[ -e "${_runtime_dir}/usr/share/fex-emu/${rel}" ]]; then
       cp -a "${_runtime_dir}/usr/share/fex-emu/${rel}" "${pkgdir}/usr/share/fex-emu/"
     fi
   done
+
+  if [[ -f "${_runtime_dir}/usr/lib/libvulkan_freedreno.so" ]]; then
+    install -Dm755 "${_runtime_dir}/usr/lib/libvulkan_freedreno.so" \
+      "${pkgdir}/usr/lib/libvulkan_freedreno.so"
+  fi
 
   python - "${pkgdir}/usr/share/fex-emu/ThunksDB.json" <<'PY'
 import json

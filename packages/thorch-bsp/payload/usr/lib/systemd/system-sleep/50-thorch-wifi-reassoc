@@ -1,0 +1,35 @@
+#!/bin/bash
+# 50-thorch-wifi-reassoc — reassociate WiFi after s2idle resume.
+#
+# The ath12k device (wlp1s0) resumes with the link UP but NO-CARRIER
+# (not associated); NetworkManager does not always recover on its own.
+# This hook only acts after resume (post), only when the failure is
+# present, and only touches NetworkManager — it does not modify any
+# hardware state during the suspend transition.
+#
+# Recovery ladder: wait for self-recovery, then restart NetworkManager
+# (the recovery verified on the Thor) and trigger a scan so the saved
+# profile is found again.
+case "$1" in
+  post)
+    # No wlp1s0 on this system: nothing to do.
+    if ! ip link show wlp1s0 >/dev/null 2>&1; then
+      exit 0
+    fi
+    # Healthy (associated) WiFi: nothing to do.
+    if ip link show wlp1s0 2>/dev/null | grep -q 'LOWER_UP'; then
+      exit 0
+    fi
+    # Give the device a moment to associate on its own.
+    sleep "${THORCH_WIFI_RETRY_DELAY:-3}"
+    if ip link show wlp1s0 2>/dev/null | grep -q 'LOWER_UP'; then
+      exit 0
+    fi
+    # Still down: restart NetworkManager, then rescan so the saved
+    # profile is found again.
+    systemctl restart NetworkManager
+    sleep "${THORCH_WIFI_RESCAN_DELAY:-2}"
+    nmcli device wifi rescan 2>/dev/null || true
+    ;;
+esac
+exit 0
