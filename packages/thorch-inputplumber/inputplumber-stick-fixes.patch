@@ -1,0 +1,234 @@
+diff --git a/src/config/mod.rs b/src/config/mod.rs
+index f62a9eb..dd0abd8 100644
+--- a/src/config/mod.rs
++++ b/src/config/mod.rs
+@@ -89,17 +89,21 @@ impl ProfileMapping {
+                 // Axis was defined for source event!
+                 if let Some(direction) = axis.direction.as_ref() {
+                     // A direction was defined!
++                    // Match while the axis is within deadzone of resting so that
++                    // the mapping stays consulted and emits the release when the
++                    // analog stick settles (even slightly past center).
++                    let threshold = axis.deadzone.unwrap_or(0.3);
+                     let value = event.get_value();
+                     return match value {
+                         InputValue::Vector2 { x, y } => match direction.as_str() {
+                             // Left should be a negative value
+-                            "left" => x.filter(|&x| x <= 0.0).is_some(),
++                            "left" => x.filter(|&x| x <= threshold).is_some(),
+                             // Right should be a positive value
+-                            "right" => x.filter(|&x| x >= 0.0).is_some(),
++                            "right" => x.filter(|&x| x >= -threshold).is_some(),
+                             // Up should be a negative value
+-                            "up" => y.filter(|&y| y <= 0.0).is_some(),
++                            "up" => y.filter(|&y| y <= threshold).is_some(),
+                             // Down should be a positive value
+-                            "down" => y.filter(|&y| y >= 0.0).is_some(),
++                            "down" => y.filter(|&y| y >= -threshold).is_some(),
+                             _ => false,
+                         },
+                         // Other values should never be used if this was an axis
+diff --git a/src/input/composite_device/mod.rs b/src/input/composite_device/mod.rs
+index fd2fdd7..37c00f1 100644
+--- a/src/input/composite_device/mod.rs
++++ b/src/input/composite_device/mod.rs
+@@ -9,6 +9,8 @@ use std::{
+         BTreeSet, HashSet,
+     },
+     error::Error,
++    sync::Mutex,
++    time::Instant,
+ };
+ 
+ use evdev::InputEvent;
+@@ -110,6 +112,11 @@ pub struct CompositeDevice {
+     /// Keep track of translated events we've emitted so we can send
+     /// release events
+     emitted_mappings: HashSet<String>,
++    /// Per-axis guard against stick-rebound ringing: remembers the sign of the
++    /// last press on each (axis, member) so an opposite-sign press landing
++    /// shortly afterward (the stick overshooting past center in a ring) is
++    /// suppressed until the ring has died.
++    axis_press_guard: Mutex<HashMap<(String, bool), (f64, Instant)>>,
+     /// Mode defining how inputs should be routed
+     intercept_mode: InterceptMode,
+     /// Transmit channel for sending commands to this composite device
+@@ -194,6 +201,7 @@ impl CompositeDevice {
+             translatable_active_inputs: Vec::new(),
+             translated_recent_events: HashSet::new(),
+             emitted_mappings: HashSet::new(),
++            axis_press_guard: Mutex::new(HashMap::new()),
+             intercept_mode: InterceptMode::None,
+             tx: tx.clone(),
+             rx,
+@@ -947,11 +955,11 @@ impl CompositeDevice {
+                 | Capability::Sync
+                 | Capability::DBus(_) => {}
+                 Capability::Keyboard(_) => {
+-                    if !self.is_new_active_event(&cap, is_pressed) {
++                    if !self.is_new_active_event(&cap, event.pressed()) {
+                         continue;
+                     }
+                     if self
+-                        .is_intercept_event(&event, is_pressed, intercept)
++                        .is_intercept_event(&event, event.pressed(), intercept)
+                         .await?
+                     {
+                         continue;
+@@ -959,11 +967,11 @@ impl CompositeDevice {
+                 }
+                 Capability::Gamepad(ref t) => match t {
+                     Gamepad::Button(_) => {
+-                        if !self.is_new_active_event(&cap, is_pressed) {
++                        if !self.is_new_active_event(&cap, event.pressed()) {
+                             continue;
+                         }
+                         if self
+-                            .is_intercept_event(&event, is_pressed, intercept)
++                            .is_intercept_event(&event, event.pressed(), intercept)
+                             .await?
+                         {
+                             continue;
+@@ -978,11 +986,11 @@ impl CompositeDevice {
+                 Capability::Mouse(ref t) => match t {
+                     Mouse::Motion => {}
+                     Mouse::Button(_) => {
+-                        if !self.is_new_active_event(&cap, is_pressed) {
++                        if !self.is_new_active_event(&cap, event.pressed()) {
+                             continue;
+                         }
+                         if self
+-                            .is_intercept_event(&event, is_pressed, intercept)
++                            .is_intercept_event(&event, event.pressed(), intercept)
+                             .await?
+                         {
+                             continue;
+@@ -1556,6 +1564,111 @@ impl CompositeDevice {
+                         continue;
+                     }
+ 
++                    // Hysteresis: once a button fed by an analog axis is
++                    // pressed, keep it pressed until the axis returns inside a
++                    // smaller release band (half the deadzone). Prevents
++                    // press/release churn while the stick settles around the
++                    // press threshold, and stops a rebound from re-triggering.
++                    let release_threshold = mapping
++                        .source_event
++                        .gamepad
++                        .as_ref()
++                        .and_then(|gamepad| gamepad.axis.as_ref())
++                        .map(|axis| (axis.deadzone.unwrap_or(0.3) * 0.5).max(0.06))
++                        .unwrap_or(0.3);
++                    let suppress_release = match value {
++                        InputValue::Bool(false) if self.active_inputs.contains(&target_cap) => {
++                            if let Some(gamepad) = mapping.source_event.gamepad.as_ref() {
++                                if let Some(axis) = gamepad.axis.as_ref() {
++                                    if let Some(direction) = axis.direction.as_ref() {
++                                        if let InputValue::Vector2 { x, y } = event.get_value() {
++                                            let magnitude = match direction.as_str() {
++                                                "left" | "right" => x
++                                                    .unwrap_or(0.0)
++                                                    .abs(),
++                                                "up" | "down" => y
++                                                    .unwrap_or(0.0)
++                                                    .abs(),
++                                                _ => f64::MAX,
++                                            };
++                                            magnitude >= release_threshold
++                                        } else {
++                                            false
++                                        }
++                                    } else {
++                                        false
++                                    }
++                                } else {
++                                    false
++                                }
++                            } else {
++                                false
++                            }
++                        }
++                        _ => false,
++                    };
++                    if suppress_release {
++                        continue;
++                    }
++
++                    // Rebound guard: a fresh press that immediately reverses a
++                    // recent press on the same (axis, member) is almost always
++                    // the stick ringing back past the deadzone after a flick.
++                    // Suppress it for a short window so a right flick cannot
++                    // emit a phantom left input.
++                    match value {
++                        InputValue::Bool(true) => {
++                            if let Some(gamepad) = mapping.source_event.gamepad.as_ref() {
++                                if let Some(axis) = gamepad.axis.as_ref() {
++                                    if let Some(direction) = axis.direction.as_ref() {
++                                        let (is_x, sign) = match direction.as_str() {
++                                            "left" => (true, -1.0),
++                                            "right" => (true, 1.0),
++                                            "up" => (false, -1.0),
++                                            "down" => (false, 1.0),
++                                            _ => (true, 1.0),
++                                        };
++                                        let magnitude = match event.get_value() {
++                                            InputValue::Vector2 { x, y } => {
++                                                if is_x {
++                                                    x.unwrap_or(0.0)
++                                                } else {
++                                                    y.unwrap_or(0.0)
++                                                }
++                                                .abs()
++                                            }
++                                            _ => f64::MAX,
++                                        };
++                                        let key = (format!("{axis:?}"), is_x);
++                                        let mut guard = self.axis_press_guard.lock().unwrap();
++                                        // Suppress a press on this axis that arrives
++                                        // shortly after (120ms) another press on the
++                                        // SAME axis, in either direction, while the
++                                        // magnitude is still shallow (< 0.40). A stick
++                                        // ringing back after a flick re-crosses the
++                                        // press threshold on the SAME side (same-sign
++                                        // re-press) or the opposite side (phantom),
++                                        // both within a few tens of ms. A committed
++                                        // deep reversal (>= 0.40) passes immediately.
++                                        let ring = guard
++                                            .get(&key)
++                                            .map(|(_, at): &(f64, Instant)| {
++                                                magnitude < 0.40
++                                                    && at.elapsed()
++                                                        < Duration::from_millis(120)
++                                            })
++                                            .unwrap_or(false);
++                                        if ring {
++                                            continue;
++                                        }
++                                        guard.insert(key, (sign, Instant::now()));
++                                    }
++                                }
++                            }
++                        }
++                        _ => {}
++                    }
++
+                     let event = NativeEvent::new_translated(source_cap.clone(), target_cap, value);
+                     events.push(event);
+                 }
+@@ -1934,6 +2047,16 @@ impl CompositeDevice {
+     /// sent in that is not active it will retuirn false.
+     fn is_new_active_event(&mut self, cap: &Capability, is_pressed: bool) -> bool {
+         let active = self.active_inputs.contains(cap);
++        // A press for an already-pressed capability is a duplicate fan-out from
++        // the analog axis staying past the press threshold across repeated ABS
++        // updates. Button state is edge-triggered: emit a keydown once, not
++        // once per reporting interval, or sway sees a rapid train of repeated
++        // inputs. The release is what resets the cap, so a genuine second press
++        // after a real release still fires.
++        if is_pressed && active {
++            log::trace!("Blocked repeat press for capability: {cap:?}");
++            return false;
++        }
+         if is_pressed && !active {
+             log::trace!("New active capability: {cap:?}");
+             self.active_inputs.push(cap.clone());

@@ -2,18 +2,44 @@
 
 pkgname=thorch-inputplumber
 pkgver=0.78.0
-pkgrel=1
-pkgdesc='Input router and remapper for AYN Odin 2'
+pkgrel=2
+pkgdesc='Input router and remapper for AYN Odin 2 (patched engine: RS stuck-key and churn fixes)'
 arch=(aarch64)
 url='https://github.com/ShadowBlip/InputPlumber'
 license=(GPL3)
 depends=(dbus glibc libevdev libgcc libiio polkit systemd-libs)
-source=("https://github.com/ShadowBlip/InputPlumber/releases/download/v${pkgver}/inputplumber-aarch64.tar.gz")
-sha256sums=('8abbd4d1787757cb0be87aa2e11f3a1d03b9dd6fd2c68f08b0e10f1dc3e31e13')
+makedepends=(cargo clang)
+source=(
+  "https://github.com/ShadowBlip/InputPlumber/archive/refs/tags/v${pkgver}.tar.gz"
+  "https://github.com/ShadowBlip/InputPlumber/releases/download/v${pkgver}/inputplumber-aarch64.tar.gz"
+  "inputplumber-stick-fixes.patch"
+)
+sha256sums=(
+  '65ad2d2b4a26a09c62c791406a5f413c329207e98d6f7785966ad772e153b4c6'
+  '8abbd4d1787757cb0be87aa2e11f3a1d03b9dd6fd2c68f08b0e10f1dc3e31e13'
+  '4a3428cd8806d3f01be3a1f43a71ca55f5e9e6977f25b76ce7b7a402f2faea1d'
+)
+
+prepare() {
+  cd "${srcdir}/InputPlumber-${pkgver}"
+  patch -Np1 -i "${srcdir}/inputplumber-stick-fixes.patch"
+}
+
+build() {
+  cd "${srcdir}/InputPlumber-${pkgver}"
+  export CARGO_HOME="${srcdir}/.cargo"
+  export CARGO_TARGET_DIR="${srcdir}/target"
+  export CARGO_NET_OFFLINE=false
+  # Keep build paths out of the binary (panic/debug metadata).
+  export RUSTFLAGS="--remap-path-prefix=${srcdir}=."
+  cargo build --release --locked
+}
 
 package() {
+  # Ship the official release's data files (capability maps, schema, systemd
+  # unit, udev rules, configs) byte-identical to stock 0.78.0.
   cp -a "${srcdir}/inputplumber/." "${pkgdir}/"
-  chmod 755 "${pkgdir}/usr/bin/inputplumber"
-
+  # Overwrite the binary with the patched engine build.
+  install -Dm755 "${srcdir}/target/release/inputplumber" "${pkgdir}/usr/bin/inputplumber"
   cp -a "${startdir}/payload/." "${pkgdir}/"
 }
