@@ -1,0 +1,100 @@
+#!/bin/bash
+# 52-thorch-usb-reprobe — soft-replug USB devices that went missing after
+# s2idle resume.
+#
+# After s2idle the xHCI root hubs lose power and re-initialize. Usually a
+# downstream hub (e.g. the Dell dock) re-enumerates cleanly, but on the
+# Thor one device often fails to re-attach. The observed case is the Dell
+# KB216 on the dock (usb 1-1.2): either the device silently drops, or the
+# whole USB2 upstream port fails with "hub failed to enable device, error
+# -108" while the dock's USB3 half survives.
+#
+# This hook is generic, not keyboard-hardcoded. Before suspend it
+# snapshots the USB device tree (pre phase, read-only); after resume it
+# looks up every device that was present in the snapshot but is missing
+# from the live tree and cycles the "authorized" flag of its parent hub.
+# Cycling authorized makes that hub re-run the port scan, re-attaching
+# devices that were silently dropped. If the parent hub itself vanished
+# (the -108 variant) it falls back to the root hub of that bus (usbN),
+# which is the best a software cycle can do — a stuck USB-PD/PHY link
+# still needs a physical replug, which is logged.
+#
+# Devices that were already absent in the pre snapshot (legitimately
+# unplugged) are never touched. Only the post phase writes sysfs; the pre
+# phase only writes a snapshot file under /run. No module loads/unloads,
+# no hardware state changes during the suspend transition itself.
+#
+# THORCH_USB_SYSFS_ROOT     override /sys (used by tests)
+# THORCH_USB_SNAPSHOT_FILE  override the pre-suspend snapshot path
+case "$1" in
+  pre)
+    root="${THORCH_USB_SYSFS_ROOT:-/sys}"
+    snap="${THORCH_USB_SNAPSHOT_FILE:-/run/thorch/usb-devices-pre-suspend}"
+    mkdir -p "$(dirname "${snap}")" 2>/dev/null || exit 0
+    : > "${snap}" 2>/dev/null || exit 0
+    for dev in "${root}"/bus/usb/devices/*; do
+      name="$(basename "${dev}")"
+      case "${name}" in
+        *:*) continue ;;   # interface dir (e.g. 1-1:1.0)
+        usb*) continue ;;  # root hub (e.g. usb1)
+      esac
+      # The parent hub is encoded in the device address (BUS-PORT.PORT...),
+      # so derive it arithmetically instead of reading the sysfs "parent"
+      # symlink, which systems like this may not resolve in the pre phase.
+      # "1-1.3.1" sits on hub "1-1.3"; top-level "1-1" sits on root "usb1".
+      bus="${name%%-*}"
+      path="${name#*-}"
+      if [[ "${path}" == *.* ]]; then
+        parent="${bus}-${path%.*}"
+      else
+        parent="usb${bus}"
+      fi
+      printf '%s\t%s\n' "${parent}" "${name}" >> "${snap}"
+    done
+    ;;
+  post)
+    root="${THORCH_USB_SYSFS_ROOT:-/sys}"
+    snap="${THORCH_USB_SNAPSHOT_FILE:-/run/thorch/usb-devices-pre-suspend}"
+    [ -r "${snap}" ] || exit 0
+
+    missing=""
+    while IFS=$'\t' read -r parent name; do
+      [ -n "${name}" ] || continue
+      [ -e "${root}/bus/usb/devices/${name}" ] || missing+="${name} "
+    done < "${snap}"
+    [ -n "${missing}" ] || exit 0
+
+    # Cycle each affected parent hub once (deduplicated).
+    seen=""
+    while IFS=$'\t' read -r parent name; do
+      [ -n "${name}" ] || continue
+      [ -e "${root}/bus/usb/devices/${name}" ] && continue
+      case " ${seen} " in
+        *" ${parent} "*) continue ;;
+      esac
+      seen+="${parent} "
+      auth="${root}/bus/usb/devices/${parent}/authorized"
+      if [ ! -w "${auth}" ]; then
+        # Parent hub itself is gone: fall back to the root hub of that bus.
+        auth="${root}/bus/usb/devices/usb${name%%-*}/authorized"
+      fi
+      [ -w "${auth}" ] || continue
+      echo 0 > "${auth}"
+      sleep "${THORCH_USB_REPROBE_DELAY:-1}"
+      echo 1 > "${auth}"
+    done < "${snap}"
+
+    sleep "${THORCH_USB_SETTLE_DELAY:-3}"
+    still_missing=""
+    for name in ${missing}; do
+      [ -e "${root}/bus/usb/devices/${name}" ] || still_missing+="${name} "
+    done
+    if [ -z "${still_missing}" ]; then
+      logger -t thorch-usb-reprobe "USB device(s) re-attached after resume"
+    else
+      logger -t thorch-usb-reprobe \
+        "USB device(s) still missing after re-enumeration: ${still_missing}— replug the hub/dock"
+    fi
+    ;;
+esac
+exit 0

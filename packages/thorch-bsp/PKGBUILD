@@ -2,7 +2,7 @@
 
 pkgname=thorch-bsp
 pkgver=1
-pkgrel=40
+pkgrel=42
 pkgdesc='Thorch AYN Thor boot and board support package'
 arch=(aarch64)
 url='https://github.com/ROCKNIX/distribution'
@@ -81,6 +81,7 @@ package() {
   chmod 755 "${pkgdir}/usr/lib/thorch/create-bootstrap-ready-package"
   chmod 755 "${pkgdir}/usr/lib/systemd/system-sleep/50-thorch-wifi-reassoc"
   chmod 755 "${pkgdir}/usr/lib/systemd/system-sleep/51-thorch-touchscreen-reprobe"
+  chmod 755 "${pkgdir}/usr/lib/systemd/system-sleep/52-thorch-usb-reprobe"
   chmod 755 "${pkgdir}/usr/lib/initcpio/install/thorch-firmware"
   chmod 755 "${pkgdir}/usr/lib/initcpio/install/thorch-sd-prefer"
   chmod 755 "${pkgdir}/usr/lib/initcpio/hooks/thorch-sd-prefer"
