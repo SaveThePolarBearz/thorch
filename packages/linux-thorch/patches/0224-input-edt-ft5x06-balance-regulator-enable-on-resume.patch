@@ -1,0 +1,121 @@
+From: Thorch contributors
+Subject: [PATCH] input: edt-ft5x06: keep resume power-up symmetric when power is retained
+
+Patch 0019 reworked this resume path so the re-initialization always
+runs, and in doing so narrowed the early-return guard from
+
+	if (device_may_wakeup(dev) || tsdata->retain_power_in_suspend)
+
+down to
+
+	if (device_may_wakeup(dev))
+
+That change only guarded one half of the power cycle. When a board sets
+edt,retain-power-in-suspend, edt_ft5x06_ts_suspend() still returns early
+and never calls regulator_disable(), but the resume path went on to
+toggle the reset line and call regulator_enable() on both vcc and iovcc
+unconditionally. Every suspend/resume cycle therefore leaked one enable
+reference per regulator.
+
+The leak is silent until the controller is unbound, at which point the
+devm cleanup action disables each regulator exactly once and
+_regulator_put() trips WARN_ON(regulator->enable_count):
+
+WARNING: drivers/regulator/core.c:2663 at _regulator_put+0x5c/0x70
+
+On the AYN Thor both touch controllers are set edt,retain-power-in-suspend
+(qcs8550-ayn-thor.dts), so 51-thorch-touchscreen-reprobe tripped this
+twice per resume, once per controller, on every cycle. regulator_summary
+showed the count climbing with the cycle count.
+
+Restore the symmetry: when power was retained through suspend, skip the
+reset toggle and the regulator_enable() calls and go straight to the
+re-initialization. The re-initialization is what actually clears the
+corrupted touch engine on resume, so it still runs unconditionally and
+the fix from 0019 is preserved.
+
+Fixes: 0019-input-edt-ft5x06-reinit-on-resume.patch
+---
+ drivers/input/touchscreen/edt-ft5x06.c | 61 +++++++++++++++++++++---------------
+ 1 file changed, 36 insertions(+), 23 deletions(-)
+
+---
+--- a/drivers/input/touchscreen/edt-ft5x06.c
++++ b/drivers/input/touchscreen/edt-ft5x06.c
+@@ -1457,36 +1457,49 @@
+ 			disable_irq(tsdata->client->irq);
+ 
+ 		/*
+-		 * We can't check if the regulator is a dummy or a real
+-		 * regulator. So we need to specify the 5ms reset time (T_rst)
+-		 * here instead of the 100us T_rtp time. We also need to wait
+-		 * 300ms in case it was a real supply and the power was cutted
+-		 * of. Toggle the reset pin is also a way to exit the hibernate
+-		 * mode.
++		 * Keep the power-up side symmetric with the power-down side.
++		 * edt_ft5x06_ts_suspend() returns early when power is
++		 * retained, so it never dropped these regulators. Toggling
++		 * the reset line and calling regulator_enable() here anyway
++		 * would leak one enable reference per suspend/resume cycle
++		 * and eventually trip WARN_ON(regulator->enable_count) in
++		 * _regulator_put() when the controller is unbound. Skip
++		 * straight to the re-initialization below, which is what
++		 * actually clears the corrupted touch engine.
+ 		 */
+-		gpiod_set_value_cansleep(reset_gpio, 1);
+-		usleep_range(5000, 6000);
+-
+-		ret = regulator_enable(tsdata->iovcc);
+-		if (ret) {
+-			dev_err(dev, "Failed to enable iovcc\n");
+-			return ret;
++		if (!tsdata->retain_power_in_suspend) {
++			/*
++			 * We can't check if the regulator is a dummy or a real
++			 * regulator. So we need to specify the 5ms reset time (T_rst)
++			 * here instead of the 100us T_rtp time. We also need to wait
++			 * 300ms in case it was a real supply and the power was cutted
++			 * of. Toggle the reset pin is also a way to exit the hibernate
++			 * mode.
++			 */
++			gpiod_set_value_cansleep(reset_gpio, 1);
++			usleep_range(5000, 6000);
++
++			ret = regulator_enable(tsdata->iovcc);
++			if (ret) {
++				dev_err(dev, "Failed to enable iovcc\n");
++				return ret;
++			}
++
++			/* Delay enabling VCC for > 10us (T_ivd) after IOVCC */
++			usleep_range(10, 100);
++
++			ret = regulator_enable(tsdata->vcc);
++			if (ret) {
++				dev_err(dev, "Failed to enable vcc\n");
++				regulator_disable(tsdata->iovcc);
++				return ret;
++			}
++
++			usleep_range(1000, 2000);
++			gpiod_set_value_cansleep(reset_gpio, 0);
++			msleep(300);
+ 		}
+ 
+-		/* Delay enabling VCC for > 10us (T_ivd) after IOVCC */
+-		usleep_range(10, 100);
+-
+-		ret = regulator_enable(tsdata->vcc);
+-		if (ret) {
+-			dev_err(dev, "Failed to enable vcc\n");
+-			regulator_disable(tsdata->iovcc);
+-			return ret;
+-		}
+-
+-		usleep_range(1000, 2000);
+-		gpiod_set_value_cansleep(reset_gpio, 0);
+-		msleep(300);
+-
+ 		/*
+ 		 * Re-run the probe-time initialization.  The FT5x06
+ 		 * controllers on some boards (AYN Thor) come back from s2idle
