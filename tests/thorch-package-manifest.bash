@@ -14,7 +14,7 @@ fail() {
 
 python3 "${cli}" --repo "${root}" validate >/dev/null
 [[ "$(python3 "${cli}" --repo "${root}" version thorch-inputplumber)" == \
-  "0.78.0-1" ]] ||
+  "0.78.0-2" ]] ||
   fail "manifest CLI did not derive the current static package version"
 [[ "$(python3 "${cli}" --repo "${root}" version thorch-fex)" == "2607-7" ]] ||
   fail "manifest CLI did not resolve aliases while deriving package versions"
