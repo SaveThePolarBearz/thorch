@@ -1,0 +1,63 @@
+From: Thorch contributors
+Subject: [PATCH] phy: eusb2: re-apply PHY mode after resume re-initialization
+
+The SM8550 USB2 chain on the AYN Thor is two PHYs: the SNPS eUSB2 high
+speed PHY (88e3000, phy-snps-eusb2) chains the PM8550B eUSB2 repeater
+via its "phys" property. dwc3 in host mode calls phy_set_mode() once at
+probe time (dwc3_core_init_mode) and never again, so the repeater's
+host-mode forced-clock workaround (EUSB2_FORCE_EN_5 F_CLK_19P2M_EN /
+EUSB2_FORCE_VAL_5 V_CLK_19P2M_EN, written only in eusb2_repeater_set_mode)
+is set exactly once per boot.
+
+On s2idle resume dwc3 re-initializes the USB PHY chain through
+phy_exit()/phy_init() (full-reinit path, taken because usb@a600000 has
+no wakeup-source). phy_exit() on the repeater disables its regulators
+and phy_init() re-enables them and rewrites only the tune register
+table - the forced-clock bits are lost and never restored, so the USB2
+link cannot re-train during port enable. Result after every suspend:
+
+    usb 1-1: reset high-speed USB device ...
+    hub failed to enable device, error -108
+
+while the USB3 side survives (the QMP combo PHY re-enables its clocks
+via its own runtime-PM resume). Only a physical dock replug recovers
+USB2 because it re-initializes the whole electrical path.
+
+Fix: in snps_eusb2_hsphy_init(), re-apply the last known PHY mode to
+the repeater after the per-SoC init sequence, mirroring the probe order
+(probe runs phy_init() first, then dwc3_core_init_mode() calls
+phy_set_mode()). At probe phy->mode is PHY_MODE_INVALID so the call is
+a no-op; every resume re-initialization restores the forced-clock bits.
+
+The repeater alone cannot do this: it has no mode tracking - the mode
+is stored by the hsphy driver in its phy->mode.
+
+Tested-by: not yet - requires a Thorch kernel rebuild + flash + suspend
+cycle verification (3x 10s lid suspend, then 1x ~1h docked).
+---
+ drivers/phy/phy-snps-eusb2.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+--- a/drivers/phy/phy-snps-eusb2.c
++++ b/drivers/phy/phy-snps-eusb2.c
+@@ -492,6 +492,20 @@
+ 	if (ret)
+ 		goto disable_clks;
+ 
++	/*
++	 * dwc3 only calls phy_set_mode() at probe (dwc3_core_init_mode).
++	 * After s2idle the USB PHY chain is re-initialized via
++	 * phy_exit()/phy_init(), but the repeater's host-mode forced-clock
++	 * workaround (EUSB2_FORCE_EN_5 F_CLK_19P2M_EN / EUSB2_FORCE_VAL_5
++	 * V_CLK_19P2M_EN) lives only in eusb2_repeater_set_mode() and is
++	 * never re-applied, so the USB2 link cannot re-train during port
++	 * enable ("hub failed to enable device, error -108"). Re-apply the
++	 * last known mode so the forced clock is restored on every re-init.
++	 * At probe phy->mode is PHY_MODE_INVALID so this is a no-op.
++	 */
++	if (phy->mode != PHY_MODE_INVALID)
++		phy_set_mode_ext(phy->repeater, phy->mode, 0);
++
+ 	return 0;
+ 
+ disable_clks:
