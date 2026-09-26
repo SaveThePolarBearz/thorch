@@ -1,0 +1,43 @@
+From: Thorch contributors
+Subject: [PATCH] clk: qcom: gcc-sm8550: Do not turn off USB GDSCs during gdsc_disable()
+
+With PWRSTS_OFF_ON, USB GDSCs are turned off during gdsc_disable(). This
+can happen during scenarios such as system suspend and breaks the resume
+of USB controller from suspend.
+
+So use PWRSTS_RET_ON to indicate the GDSC driver to not turn off the GDSCs
+during gdsc_disable() and allow the hardware to transition the GDSCs to
+retention when the parent domain enters low power state during system
+suspend.
+
+Mirrors the merged upstream SM8650 fix
+clk: qcom: gcc-sm8650: Do not turn off USB GDSCs during gdsc_disable()
+(SM8550 usb_1 observed faulting on resume with SID=0x40 cb=9 TF, leading
+to xhci Host System Error and a dead dock until reboot).
+
+Fixes: 955f2ea3b9e9 ("clk: qcom: Add GCC driver for SM8550")
+---
+ drivers/clk/qcom/gcc-sm8550.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+--- a/drivers/clk/qcom/gcc-sm8550.c
++++ b/drivers/clk/qcom/gcc-sm8550.c
+@@ -3063,7 +3063,7 @@
+ 	.pd = {
+ 		.name = "usb30_prim_gdsc",
+ 	},
+-	.pwrsts = PWRSTS_OFF_ON,
++	.pwrsts = PWRSTS_RET_ON,
+ 	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE,
+ };
+ 
+@@ -3072,7 +3072,7 @@
+ 	.pd = {
+ 		.name = "usb3_phy_gdsc",
+ 	},
+-	.pwrsts = PWRSTS_OFF_ON,
++	.pwrsts = PWRSTS_RET_ON,
+ 	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE,
+ };
+ 
+
