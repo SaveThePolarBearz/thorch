@@ -2,7 +2,7 @@
 
 pkgname=thorch-bsp
 pkgver=1
-pkgrel=42
+pkgrel=43
 pkgdesc='Thorch AYN Thor boot and board support package'
 arch=(aarch64)
 url='https://github.com/ROCKNIX/distribution'
@@ -68,6 +68,7 @@ package() {
   chmod 755 "${pkgdir}/usr/bin/thorch-hw-defaults"
   chmod 755 "${pkgdir}/usr/bin/thorch-hardwarectl"
   chmod 755 "${pkgdir}/usr/bin/thorch-lavd-mode"
+  chmod 755 "${pkgdir}/usr/bin/thorch-pm-debug"
   rm -f "${pkgdir}/usr/bin/thorch-powerkeyd"
   install -Dm755 "${srcdir}/thorch-inputd" "${pkgdir}/usr/bin/thorch-inputd"
   chmod 755 "${pkgdir}/usr/bin/thorch-rgb"

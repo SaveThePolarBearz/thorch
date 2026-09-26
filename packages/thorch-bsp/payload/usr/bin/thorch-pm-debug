@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# thorch-pm-debug — arm or disarm the kernel's per-device suspend/resume
+# PM_DEBUG instrumentation at runtime.
+#
+# The Thor kernel is built with CONFIG_PM_DEBUG=y and
+# CONFIG_DYNAMIC_DEBUG=y (see config/thorch.conf THORCH_KERNEL_CONFIG), but
+# the runtime knobs are OFF by default, so the per-device suspend/resume
+# callbacks print nothing. This writes the sysfs/dynamic-debug knobs directly,
+# which needs no kernel cmdline change and no ABL repack. Once armed, the
+# setting lives in kernel memory and stays armed across s2idle until reboot or
+# until explicitly disarmed.
+#
+# Usage:
+#   thorch-pm-debug apply    # arm (idempotent)
+#   thorch-pm-debug disarm   # turn back off
+#   thorch-pm-debug status   # report current state
+#
+# Config (via /etc/thorch/hardware.conf EnvironmentFile or the environment):
+#   THORCH_PM_DEBUG=1        # arm at boot (thorch-pm-debug.service)
+set -euo pipefail
+
+sysfs_root="${THORCH_PM_DEBUG_SYSFS_ROOT:-/sys}"
+debugfs_root="${THORCH_PM_DEBUG_DEBUGFS_ROOT:-/sys/kernel/debug}"
+# The dev_dbg()-based pm_dev_dbg() call sites live in this file; the
+# __pm_pr_dbg() force-print sites are covered by the sysfs knob above.
+dyndbg_file="${THORCH_PM_DEBUG_DYNDBG_FILE:-drivers/base/power/main.c}"
+
+pm_debug_messages="${sysfs_root}/power/pm_debug_messages"
+dyndbg_control="${debugfs_root}/dynamic_debug/control"
+
+log() { printf 'thorch-pm-debug: %s\n' "$*"; }
+
+# Return 0 if the kernel exports the pm_debug_messages knob.
+have_pm_debug_knob() { [[ -e "${pm_debug_messages}" ]]; }
+
+# Return 0 if the dynamic_debug control interface is reachable.
+have_dyndbg() { [[ -w "${dyndbg_control}" ]]; }
+
+arm() {
+  if ! have_pm_debug_knob; then
+    # Feature absent (kernel built without CONFIG_PM_DEBUG): a graceful no-op
+    # for a diagnostic, not a failure.
+    log "pm_debug_messages knob not present (kernel lacks CONFIG_PM_DEBUG?); nothing to arm"
+    return 0
+  fi
+  if printf '1' >"${pm_debug_messages}" 2>/dev/null; then
+    log "armed per-device PM_DEBUG (${pm_debug_messages}=1)"
+  else
+    log "failed to write ${pm_debug_messages}"
+    return 1
+  fi
+
+  if have_dyndbg; then
+    if printf 'file %s +p' "${dyndbg_file}" >"${dyndbg_control}" 2>/dev/null; then
+      log "enabled pm_dev_dbg dyndbg sites (file ${dyndbg_file} +p)"
+    else
+      log "failed to enable dyndbg sites (non-fatal)"
+    fi
+  else
+    log "dynamic_debug/control not writable; pm_dev_dbg dev_dbg() sites left off"
+  fi
+  return 0
+}
+
+disarm() {
+  local rc=0
+  if have_pm_debug_knob; then
+    if printf '0' >"${pm_debug_messages}" 2>/dev/null; then
+      log "disarmed per-device PM_DEBUG (${pm_debug_messages}=0)"
+    else
+      log "failed to write ${pm_debug_messages}"
+      rc=1
+    fi
+  fi
+  if have_dyndbg; then
+    printf 'file %s -p' "${dyndbg_file}" >"${dyndbg_control}" 2>/dev/null ||
+      log "failed to disable dyndbg sites (non-fatal)"
+  fi
+  return "${rc}"
+}
+
+status() {
+  local value="absent"
+  if have_pm_debug_knob; then
+    value="$(cat "${pm_debug_messages}" 2>/dev/null || echo unreadable)"
+  fi
+  printf 'pm_debug_messages=%s\n' "${value}"
+  if have_dyndbg; then
+    if grep -q "file ${dyndbg_file} .*=p" "${dyndbg_control}" 2>/dev/null; then
+      printf 'dyndbg %s=+p\n' "${dyndbg_file}"
+    else
+      printf 'dyndbg %s=-p\n' "${dyndbg_file}"
+    fi
+  else
+    printf 'dyndbg=unavailable\n'
+  fi
+}
+
+# True when THORCH_PM_DEBUG is set to an "on" value. Defaults to off.
+pm_debug_enabled() {
+  case "${THORCH_PM_DEBUG:-0}" in
+    1|true|TRUE|yes|YES|on|ON|enabled|ENABLED) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+case "${1:-apply}" in
+  apply)
+    if pm_debug_enabled; then
+      arm
+    else
+      log "THORCH_PM_DEBUG is off; leaving PM_DEBUG disarmed (set THORCH_PM_DEBUG=1 to arm)"
+    fi
+    ;;
+  disarm) disarm ;;
+  status) status ;;
+  *)
+    printf 'usage: %s {apply|disarm|status}\n' "$0" >&2
+    exit 2
+    ;;
+esac

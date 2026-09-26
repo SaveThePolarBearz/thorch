@@ -1,0 +1,16 @@
+[Unit]
+Description=Arm Thorch kernel per-device PM_DEBUG suspend/resume instrumentation
+After=systemd-udevd.service
+# The knob only exists when the kernel was built with CONFIG_PM_DEBUG; skip
+# cleanly otherwise so this is safe on any kernel.
+ConditionPathExists=/sys/power/pm_debug_messages
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/thorch/hardware.conf
+# Default off; set THORCH_PM_DEBUG=1 in /etc/thorch/hardware.conf to arm.
+# Once armed the kernel setting persists across s2idle until reboot.
+ExecStart=/usr/bin/thorch-pm-debug apply
+
+[Install]
+WantedBy=multi-user.target
