@@ -54,6 +54,7 @@ help:
 	  '  make import-kernel BOOT_DIR=... ROOT_DIR=... [KERNEL_REF=...]' \
 	  '  make packages                     Build all local packages' \
 	  '  make packages-userspace           Build local packages except linux-thorch' \
+	  '  make packages [PACKAGES=a,b]      Build only the named local packages' \
 	  '  make build                        Build output/thorch-arch-aarch64.img' \
 	  '  make fast                         Fast rebuild after one full build' \
 	  '  make nightly                      Run audit, tests, build, and image check' \
@@ -93,7 +94,7 @@ docker-shell:
 	$(call thorch_docker_run,bash)
 
 docker-%:
-	$(call thorch_docker_run,make $* IMAGE="$(IMAGE)" DEVICE="$(DEVICE)" ROCKNIX_REF="$(ROCKNIX_REF)" BOOT_DIR="$(BOOT_DIR)" ROOT_DIR="$(ROOT_DIR)" KERNEL_REF="$(KERNEL_REF)")
+	$(call thorch_docker_run,make $* IMAGE="$(IMAGE)" DEVICE="$(DEVICE)" ROCKNIX_REF="$(ROCKNIX_REF)" BOOT_DIR="$(BOOT_DIR)" ROOT_DIR="$(ROOT_DIR)" KERNEL_REF="$(KERNEL_REF)" PACKAGES="$(PACKAGES)")
 
 doctor:
 	./scripts/doctor.sh
@@ -125,10 +126,10 @@ import-kernel:
 	fi
 
 packages:
-	$(THORCH_SUDO) ./scripts/build-packages.sh
+	$(THORCH_SUDO) ./scripts/build-packages.sh $(if $(PACKAGES),--packages "$(PACKAGES)")
 
 packages-userspace:
-	$(THORCH_SUDO) ./scripts/build-packages.sh --skip-kernel
+	$(THORCH_SUDO) ./scripts/build-packages.sh --skip-kernel $(if $(PACKAGES),--packages "$(PACKAGES)")
 
 build:
 	$(THORCH_SUDO) ./scripts/build-image.sh
