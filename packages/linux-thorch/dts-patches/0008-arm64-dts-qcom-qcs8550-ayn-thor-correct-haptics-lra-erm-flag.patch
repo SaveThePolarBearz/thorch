@@ -1,0 +1,58 @@
+From: Thorch contributors
+Subject: [PATCH] arm64: dts: qcom: qcs8550-ayn-thor: correct haptics LRA/ERM flag
+
+The shared AYN device tree claims the haptics actuator is an ERM with
+"qcom,use-erm = <0x01>", while the same node carries "qcom,lra-period-us"
+and LRA-specific brake and waveform properties, so the node contradicts
+itself.  Thor ships a linear resonant actuator, so the ERM claim is wrong
+for this board.
+
+The flag is not cosmetic.  In the qcom-hv-haptics driver it decides three
+things:
+
+  - whether haptics_parse_lra_dt() runs at all, so "qcom,lra-period-us"
+    and the LRA brake configuration are only parsed when the flag is clear;
+  - haptics_load_constant_effect() calling
+    haptics_enable_autores(chip, !chip->config.is_erm), so a set ERM flag
+    disables LRA auto resonance for every DIRECT_PLAY upload;
+  - the drive and brake waveforms, which are forced to WF_NO_MODULATION
+    when the flag is set instead of the "qcom,drv-sig-shape" sine shape.
+
+The result is a silent motor.  An FF_CONSTANT upload and its play request
+both succeed, so evdev reports no error and userspace sees a working
+device, but the actuator is driven without auto resonance and without
+modulation and moves too little to feel.  Userspace haptics libraries
+cannot work around this, because the driver accepts the request and only
+the hardware behaviour is wrong.
+
+The driver reads the flag with of_property_read_bool(), which tests
+presence, not value: overriding the property to <0x00> still leaves the
+driver in ERM mode (the kernel warns "Read of boolean property
+'qcom,use-erm' with a value" at boot).  Delete the property in the Thor
+board file so the driver falls back to the LRA path for this board only.
+The shared AYN default is left untouched for the other AYN devices, whose
+actuators this change has not been measured on.
+---
+ arch/arm64/boot/dts/qcom/qcs8550-ayn-thor.dts | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/qcs8550-ayn-thor.dts b/arch/arm64/boot/dts/qcom/qcs8550-ayn-thor.dts
+--- a/arch/arm64/boot/dts/qcom/qcs8550-ayn-thor.dts
++++ b/arch/arm64/boot/dts/qcom/qcs8550-ayn-thor.dts
+@@ -164,5 +164,15 @@ multi-ledl4 {
+ 	};
+ };
+ 
++&pm8550b_hv_haptics {
++	/*
++	 * Thor's actuator is an LRA, not an ERM.  The driver reads
++	 * "qcom,use-erm" with of_property_read_bool(), which tests
++	 * presence, not value: overriding it to <0x00> still leaves the
++	 * driver in ERM mode.  Delete the property to use the LRA path.
++	 */
++	/delete-property/ qcom,use-erm;
++};
++
+ &display_panel {
+ 	compatible = "chipone,icna3520";
+ 

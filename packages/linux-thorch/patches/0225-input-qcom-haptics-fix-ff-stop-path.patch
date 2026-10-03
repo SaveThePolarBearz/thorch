@@ -1,0 +1,51 @@
+From: Thorch contributors
+Subject: [PATCH] input: qcom-hv-haptics: honour FF stop requests in playback
+
+haptics_playback() returns 0 for a stop request without touching the
+hardware, so a stop that arrives through the FF interface never reaches
+the motor:
+
+	if (!!val && !chip->chip_is_playing) {
+		...
+		return haptics_enable_play(chip, true);
+	}
+
+	return 0;
+
+That breaks any client that reuses one uploaded effect. stop_work is
+scheduled by haptics_upload_effect() at UPLOAD time for replay.length
+milliseconds, not per play, so the first play after the timer has already
+expired is never stopped: not by the ff-core replay timer, because that
+also arrives through haptics_playback() as val = 0, and not by
+EVIOCSPLAY(0), for the same reason. Only the calibration, sweep and
+stop_work paths, which call haptics_enable_play(chip, false) directly,
+ever stopped the motor.
+
+The AYN Thor's on-screen keyboard hits this on every tap. gamepad-osk
+uploads a single FF_CONSTANT effect when it opens the device and then
+plays that same id for every keypress, so the 300 ms stop_work armed at
+upload expired long before the first tap. The first tap started the LRA
+and nothing could stop it, which is what the user felt as a motor that
+would not shut off.
+
+Turn a stop request into the same direct call the working paths already
+use, but only while playing, so a late or duplicate stop stays a no-op
+and does not clear PLAY_EN or wait for a brake that was never started.
+
+Fixes: 1002-haptics-driver-support-periodic-sine-and-fixes.patch
+---
+ drivers/input/misc/qcom-hv-haptics.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+--- a/drivers/input/misc/qcom-hv-haptics.c
++++ b/drivers/input/misc/qcom-hv-haptics.c
+@@ -2858,6 +2858,9 @@
+ 		return haptics_enable_play(chip, true);
+ 	}
+
++	if (!val && chip->chip_is_playing)
++		return haptics_enable_play(chip, false);
++
+ 	return 0;
+ }
+ 

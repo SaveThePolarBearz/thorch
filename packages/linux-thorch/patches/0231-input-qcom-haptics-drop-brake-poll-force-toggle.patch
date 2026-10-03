@@ -1,0 +1,70 @@
+From: Thorch contributors
+Subject: [PATCH] input: qcom-hv-haptics: stop force-toggling HAPTICS_EN when the brake poll times out
+
+haptics_wait_brake_complete() polls HAP_CFG_HPWR_INTF_REG for
+HPWR_DISABLED after a bounded play stops, and if the poll runs out of
+its budget it falls back to haptics_toggle_module_enable():
+
+	if (timeout == 0) {
+		dev_warn(chip->dev, "poll HPWR_DISABLED failed after stopped play\n");
+		return haptics_toggle_module_enable(chip);
+	}
+
+On the Thor this fallback fires on most taps, and the power cycle it
+performs is itself audible. With dynamic debug on the haptics driver a
+burst of taps logs:
+
+	polling HPWR_INTF timeout 6, value = 3
+	polling HPWR_INTF timeout 5, value = 3
+	...
+	polling HPWR_INTF timeout 1, value = 3
+	poll HPWR_DISABLED failed after stopped play
+	haptics module disabled
+	haptics module enabled
+
+Every poll reads 3, which is HPWR_READY, and never 0, which is
+HPWR_DISABLED. This board is HAP525_HV with hbst_revision 0x2, and
+haptics_config_wa() only sets SW_CTRL_HBST for HAP_BOOST_V0P1
+(0x1), so the driver never software-controls the hBoost rail here.
+hBoost holds the rail up, HPWR_READY is the steady powered state
+rather than a fault or a completion signal, and the poll's success
+condition is not reachable while hBoost owns the rail.
+
+A minority of stops do log "stopped play completely", so the rail does
+fall to HPWR_DISABLED sometimes, but only in a racy window against the
+computed brake budget. That makes the fallback fire on some taps and
+not others, which is what the alternating vibration strength is: each
+toggle drops HAPTICS_EN and votes hBoost down and back up, and the
+taps that happen to catch the HPWR_DISABLED edge skip that transition.
+
+Note that haptics_check_hpwr_status() in the same driver already
+accepts both HPWR_DISABLED and HPWR_READY as settled, which is why
+Vmax programming does not misbehave here while this poll does. Fixing
+that by also accepting HPWR_READY here would be wrong: it would break
+out on the first poll roughly 2.4 ms into every stop and truncate the
+brake pattern rather than wait for it.
+
+Keep the recovery toggle only for states that are neither HPWR_DISABLED
+nor HPWR_READY, which is what a genuinely wedged block looks like, and
+drop the warning for the powered-idle case since it is the expected
+outcome on an hBoost rail rather than an error.
+---
+ drivers/input/misc/qcom-hv-haptics.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+--- a/drivers/input/misc/qcom-hv-haptics.c
++++ b/drivers/input/misc/qcom-hv-haptics.c
+@@ -1722,10 +1722,11 @@ static int haptics_wait_brake_complete(struct haptics_chip *chip)
+ 		dev_dbg(chip->dev, "polling HPWR_INTF timeout %d, value = %d\n",
+ 				timeout, val);
+ 	} while (--timeout);
+ 
+ 	if (timeout == 0) {
+-		dev_warn(chip->dev, "poll HPWR_DISABLED failed after stopped play\n");
+-		return haptics_toggle_module_enable(chip);
++		dev_dbg(chip->dev, "HPWR_INTF still %d after stopped play, not toggling\n", val);
++		if ((val & HPWR_INTF_STATUS_MASK) != HPWR_READY)
++			return haptics_toggle_module_enable(chip);
+ 	}
+ 
+ 	return 0;

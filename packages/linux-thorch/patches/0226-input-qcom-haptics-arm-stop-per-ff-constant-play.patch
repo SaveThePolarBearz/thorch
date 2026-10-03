@@ -1,0 +1,147 @@
+From: Thorch contributors
+Subject: [PATCH] input: qcom-hv-haptics: bound each FF_CONSTANT play by its replay length
+
+haptics_upload_effect() armed stop_work at UPLOAD time:
+
+	schedule_delayed_work(&chip->stop_work, msecs_to_jiffies(length_ms));
+	haptics_load_constant_effect(chip, amplitude);
+
+The timer therefore fires once, replay.length milliseconds after the
+effect is uploaded, and is never re-armed. Any client that uploads a
+single effect and then plays that same id repeatedly gets a working
+timer for exactly one play, and no timer at all for every play after
+it. Nothing else stops the motor: the ff-core replay timer and
+EVIOCSPLAY(0) both reach haptics_playback() with val = 0, which used to
+return 0 without touching the hardware.
+
+gamepad-osk, which drives the AYN Thor on-screen keyboard, does exactly
+this: one FF_CONSTANT upload when it opens the device, then a play per
+keypress. On thorch27 the first tap was stopped by the upload-time timer
+firing at the right moment, and the second tap ran until suspend.
+
+It also failed loudly at boot on this device. Because nothing was
+playing when the upload-time timer expired, haptics_wait_brake_complete()
+polled HPWR_DISABLED for a brake pattern that was never started and
+warned "poll HPWR_DISABLED failed after stopped play".
+
+Remember the replay length at upload time instead, and arm stop_work
+from haptics_playback() once playback has actually started. Every play
+is then bounded by the effect's own length, and the timer is only ever
+armed for a play that is really running, so the spurious brake poll
+cannot happen.
+
+While here, stop chip_is_playing from sticking. haptics_playback() only
+starts the motor when chip_is_playing is false, but haptics_enable_play()
+set that flag before any of its work that can fail, so a failed start
+left it true and every later play returned 0 silently. Route the failure
+paths through a label that clears it.
+
+Fixes: 1002-haptics-driver-support-periodic-sine-and-fixes.patch
+Fixes: 1000-add-qcom-haptics-driver.patch
+---
+ drivers/input/misc/qcom-hv-haptics.c | 48 ++++++++++++++++++++++++++++++++----
+ 1 file changed, 43 insertions(+), 5 deletions(-)
+
+--- a/drivers/input/misc/qcom-hv-haptics.c
++++ b/drivers/input/misc/qcom-hv-haptics.c
+@@ -635,6 +635,7 @@
+ 
+ 	volatile bool			chip_effect_loaded;
+ 	volatile bool			chip_is_playing;
++	u32				constant_replay_ms;
+ 	int				fifo_empty_irq;
+ 	u32				hpwr_voltage_mv;
+ 	u32				effects_count;
+@@ -1742,12 +1743,12 @@
+ 
+ 		rc = haptics_clear_fault(chip);
+ 		if (rc < 0)
+-			return rc;
++			goto out_not_playing;
+ 	}
+ 
+ 	rc = haptics_open_loop_drive_config(chip, en);
+ 	if (rc < 0)
+-		return rc;
++		goto out_not_playing;
+ 
+ 	val = play->pattern_src;
+ 	if (chip->hw_type == HAP525_HV && play->pattern_src == PATTERN_MEM)
+@@ -1763,7 +1764,7 @@
+ 			HAP_CFG_SPMI_PLAY_REG, &val, 1);
+ 	if (rc < 0) {
+ 		dev_err(chip->dev, "Write SPMI_PLAY failed, rc=%d\n", rc);
+-		return rc;
++		goto out_not_playing;
+ 	}
+ 
+ 	if (!en) {
+@@ -1793,6 +1794,17 @@
+ 
+ 	trace_qcom_haptics_play(en);
+ 	return rc;
++
++out_not_playing:
++	/*
++	 * chip_is_playing gates every later play request, so it must not stay
++	 * set when enabling playback failed. Leaving it true makes all
++	 * subsequent play calls return without starting the motor.
++	 */
++	if (en)
++		chip->chip_is_playing = false;
++
++	return rc;
+ }
+ 
+ static int haptics_set_brake(struct haptics_chip *chip, struct brake_cfg *brake)
+@@ -2766,7 +2778,13 @@
+ 		amplitude = tmp / 0x7fff;
+ 		dev_dbg(chip->dev, "upload constant effect, length = %dms, amplitude = %#x\n",
+ 				length_ms, amplitude);
+-		schedule_delayed_work(&chip->stop_work, msecs_to_jiffies(length_ms));
++		/*
++		 * Remember the length and let haptics_playback() arm the
++		 * stop timer per play. Arming it here fires it once at upload
++		 * time, which is useless for a client that uploads one effect
++		 * and then plays it repeatedly.
++		 */
++		chip->constant_replay_ms = length_ms;
+ 		haptics_load_constant_effect(chip, amplitude);
+ 		if (rc < 0) {
+ 			dev_err(chip->dev, "set direct play failed, rc=%d\n",
+@@ -2852,10 +2870,26 @@
+ 	dev_dbg(chip->dev, "playback val = %d\n", val);
+ 
+ 	if (!!val && !chip->chip_is_playing) {
++		int rc;
++
+ 		if (!chip->chip_effect_loaded)
+ 			dev_warn(chip->dev, "Trying to playback while no effect is loaded!\n");
+ 
+-		return haptics_enable_play(chip, true);
++		rc = haptics_enable_play(chip, true);
++		if (rc < 0)
++			return rc;
++
++		/*
++		 * Arm the stop here, once playback has actually started, so
++		 * every play is bounded by the effect's own replay length.
++		 * Without this a client that uploads one effect and plays it
++		 * many times runs the motor until something else stops it.
++		 */
++		if (chip->constant_replay_ms > 0)
++			schedule_delayed_work(&chip->stop_work,
++					msecs_to_jiffies(chip->constant_replay_ms));
++
++		return 0;
+ 	}
+ 
+ 	if (!val && chip->chip_is_playing)
+@@ -6029,6 +6063,7 @@
+ 
+ 	chip->chip_effect_loaded = false;
+ 	chip->chip_is_playing = false;
++	chip->constant_replay_ms = 0;
+ 
+ 	input_set_capability(input_dev, EV_FF, FF_CONSTANT);
+ 	//if ((chip->effects_count != 0) || (chip->primitives_count != 0)) {

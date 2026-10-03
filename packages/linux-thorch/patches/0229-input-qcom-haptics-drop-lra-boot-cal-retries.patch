@@ -1,0 +1,93 @@
+From: Thorch contributors
+Subject: [PATCH] input: qcom-haptics: drop the LRA boot calibration retries
+
+The AYN Thor buzzes three times at every boot and the driver throws the
+measurements away.
+
+haptics_hw_init() reads the LRA's resonant period out of the SDAM
+register at boot. That uncalibrated reading is compared against the
+LRA spec window (185-215 Hz) and, when it falls outside, the driver
+re-measures up to three times, each attempt a full-amplitude direct play
+with a 150 ms settle. On the Thor:
+
+	lra frequency detected at boot: 170 Hz
+	frequency after [1] calibration: 184 Hz
+	frequency after [2] calibration: 183 Hz
+	frequency after [3] calibration: 183 Hz
+	lra frequency is still out of range, forced set to 205 Hz, ret:0
+
+The actuator converges on the first attempt and stays there, at 183 Hz,
+2 Hz under the 185 Hz floor. So the loop always ran to exhaustion and
+then fell through to the forced 205 Hz anyway. Three loud buzzes per
+boot, no effect on the frequency the motor ends up running at.
+
+The retry exists to recover from a bad SDAM boot reading, which is what
+the workaround for b/339117433 is about. Here the boot reading is 170 Hz
+and the real measurement is 183 Hz, both out of spec by the same margin,
+so re-measuring cannot reach the window either. And because 183 Hz is
+discarded for the forced 205 Hz regardless, the retries were pure cost.
+
+Keep the boot read and the out-of-range check so the frequency ends up
+exactly where it does today, at LRA_SPEC_DEFAULT_FREQUENCY. Dropping the
+loop removes the buzzes without changing the drive frequency.
+
+Note the boot check reads config.cl_t_lra_us, which only ever comes from
+the hardware status registers, not from the "qcom,lra-period-us" DT
+property. Pinning that property in the DT cannot move this check.
+
+haptics_start_lra_calibrate() is still used by the sysfs calibration
+path, so only the forward declaration's role as an up-call from
+haptics_hw_init() goes away.
+
+One side effect to be aware of: the retries also populated the cached
+LRA impedance range through haptics_detect_lra_impedance(). Nothing in
+this driver consumes those fields, and on the Thor they are never
+written to SDAM, since that only happens on the measure_lra_impedance
+branch and the Thor has no "qcom,rt-imp-detect" property. The single
+consumer is the lra_impedance sysfs attribute, which will now report
+-EINVAL instead of a cached range until someone writes 1 to
+lra_calibration by hand. Gameplay is unaffected.
+
+Fixes: 0008-arm64-dts-qcom-qcs8550-ayn-thor-correct-haptics-lra-erm-flag.patch
+---
+ drivers/input/misc/qcom-hv-haptics.c | 21 +++++++++++++--------
+ 1 file changed, 13 insertions(+), 8 deletions(-)
+
+--- a/drivers/input/misc/qcom-hv-haptics.c
++++ b/drivers/input/misc/qcom-hv-haptics.c
+@@ -3432,7 +3432,6 @@
+ static int haptics_hw_init(struct haptics_chip *chip)
+ {
+ 	int rc;
+-	int retry = 0;
+ 	u32 cl_f_lra;
+ 
+ 	rc = haptics_config_wa(chip);
+@@ -3464,14 +3463,19 @@
+ 	// Workaround for b/339117433 since we can't reproduce it
+ 	cl_f_lra = USEC_PER_SEC / chip->config.cl_t_lra_us;
+ 	dev_info(chip->dev, "lra frequency detected at boot: %d Hz\n", cl_f_lra);
+-	while ((cl_f_lra < LRA_SPEC_MIN_FREQUENCY || cl_f_lra > LRA_SPEC_MAX_FREQUENCY) &&
+-				retry < 3) {
+-		haptics_start_lra_calibrate(chip);
+-		cl_f_lra = USEC_PER_SEC / chip->config.cl_t_lra_us;
+-		retry++;
+-		dev_info(chip->dev, "frequency after [%d] calibration: %d Hz\n", retry, cl_f_lra);
+-	}
+-
++/*
++	 * No calibration retry loop here. Upstream re-measures up to three
++	 * times when the SDAM boot reading falls outside the LRA spec
++	 * window, but on the AYN Thor the actuator settles at 183 Hz on
++	 * the first attempt and stays there for every subsequent one.
++	 * That is 2 Hz under the 185 Hz floor, so the loop always ran to
++	 * exhaustion and then fell through to the forced 205 Hz below.
++	 *
++	 * Each attempt is a full-amplitude direct play with a 150 ms
++	 * settle, so the retries were three loud buzzes at every boot for
++	 * no effect on the frequency the motor actually ran at. Only the
++	 * measurement matters, and the measurement is discarded here.
++	 */
+ 	if (cl_f_lra < LRA_SPEC_MIN_FREQUENCY ||
+ 			cl_f_lra > LRA_SPEC_MAX_FREQUENCY) {
+ 		// HACK: forced set the frequency
