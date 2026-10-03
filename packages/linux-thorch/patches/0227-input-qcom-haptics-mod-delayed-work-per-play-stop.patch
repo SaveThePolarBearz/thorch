@@ -1,0 +1,64 @@
+From: Thorch contributors
+Subject: [PATCH] input: qcom-hv-haptics: re-arm the per-play stop timer
+
+0226 arms stop_work from haptics_playback() with
+schedule_delayed_work(). That does not re-arm a work item that is
+already pending: it returns false and leaves the existing deadline in
+place. A tap that arrives while the previous play's stop is still
+pending therefore inherits the previous deadline instead of getting its
+own, so its buzz is truncated to whatever time was left.
+
+With a short replay length the truncation is severe and repeats
+predictably. At 40 ms on the AYN Thor's on-screen keyboard, a tap 35 ms
+after the previous one gets 5 ms of motor, the following tap gets a full
+40 ms because the timer has fired and cleared, and the pattern alternates
+strong/weak for as long as taps keep landing inside the pending window.
+Longer replay lengths hid it only because taps rarely landed that close.
+
+Use mod_delayed_work(), which always re-arms to the new deadline. Each
+play now owns its stop regardless of what came before it. There is no
+kernel-side replay timer to race with here: this driver registers
+through input_ff_create() rather than the ff-memless path, so ff-core
+never re-arms or expires the effect on the client's behalf, and
+stop_work is the only deadline governing a constant play.
+
+system_percpu_wq has to be passed explicitly. Unlike
+schedule_delayed_work(), mod_delayed_work() has no implicit default
+queue, and this work is bound with INIT_DELAYED_WORK() at probe, which
+does not bind one either. system_percpu_wq is what
+schedule_delayed_work() resolves to, so the work stays on the queue the
+rest of the driver already uses.
+
+The two schedule_delayed_work() calls in the FF_CONSTANT upload gain
+path are left alone: they are preceded by cancel_delayed_work_sync(), so
+the work cannot already be pending there.
+
+Fixes: 0226-input-qcom-haptics-arm-stop-per-ff-constant-play.patch
+---
+ drivers/input/misc/qcom-hv-haptics.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+--- a/drivers/input/misc/qcom-hv-haptics.c
++++ b/drivers/input/misc/qcom-hv-haptics.c
+@@ -2881,9 +2881,20 @@
+ 		 * every play is bounded by the effect's own replay length.
+ 		 * Without this a client that uploads one effect and plays it
+ 		 * many times runs the motor until something else stops it.
++		 *
++		 * mod_delayed_work(), not schedule_delayed_work(): the latter
++		 * leaves an already pending timer at its old deadline instead
++		 * of re-arming it, so a tap that arrives before the previous
++		 * stop fires inherits that stop's deadline and is cut short.
++		 *
++		 * system_percpu_wq is passed explicitly because
++		 * INIT_DELAYED_WORK() binds no workqueue and
++		 * mod_delayed_work() has no implicit default. It is the queue
++		 * schedule_delayed_work() resolves to, so this keeps the work
++		 * on the queue the rest of the driver already uses.
+ 		 */
+ 		if (chip->constant_replay_ms > 0)
+-			schedule_delayed_work(&chip->stop_work,
++			mod_delayed_work(system_percpu_wq, &chip->stop_work,
+ 					msecs_to_jiffies(chip->constant_replay_ms));
+ 
+ 		return 0;

@@ -1,0 +1,99 @@
+From: Thorch contributors
+Subject: [PATCH] input: qcom-hv-haptics: restore the rail per play and finish the flag fix
+
+Two defects left the upload-once/play-many pattern working only for the
+first tap, and one left chip_is_playing able to stick.
+
+The haptics rail is dropped on every stop. haptics_stop_constant_effect_play()
+ends each play with:
+
+	rc = haptics_enable_hpwr_vreg(chip, false);
+
+but the rail is only brought back up in haptics_upload_effect(). A client
+that uploads one effect when it opens the device and then plays it per
+keypress therefore runs every play after the first with the rail down.
+That is the strong/weak alternation seen on the AYN Thor's on-screen
+keyboard: the first tap has the rail because the upload enabled it, the
+per-play stop tears it down, and the next tap is attenuated until
+something else restores it. The re-armed stop timer from 0227 does not
+help here, it only bounds how long the motor runs.
+
+Enable the rail from haptics_playback() before starting, mirroring what
+the upload path already does. haptics_enable_hpwr_vreg() returns
+immediately when the rail is already in the requested state, so this is
+free for clients that keep it up.
+
+Because play never started on the enable_play() failure path, stop_work
+is never armed there, so nothing would turn the rail back off. Drop it
+again explicitly before returning, or a play that keeps failing leaves
+the rail energized until an erase or a teardown path happens to run.
+
+Second, 0226 routed the three failure paths in haptics_enable_play()
+through out_not_playing but missed the boost vreg one, which still did a
+plain return. chip_is_playing stays true there, and since
+haptics_playback() only starts the motor when it is false, every later
+play silently returns 0. Route it through the label as well.
+
+Third, constant_replay_ms is now stale after an erase. haptics_erase()
+cancels stop_work and stops playback, but left the recorded replay length
+behind, so a later playback() could arm a stop timer sized for an effect
+that no longer exists. Clear it alongside chip_effect_loaded.
+
+Fixes: 0226-input-qcom-haptics-arm-stop-per-ff-constant-play.patch
+
+---
+ drivers/input/misc/qcom-hv-haptics.c | 26 ++++++++++++++++++++++++--
+ 1 file changed, 24 insertions(+), 2 deletions(-)
+
+--- a/drivers/input/misc/qcom-hv-haptics.c
++++ b/drivers/input/misc/qcom-hv-haptics.c
+@@ -1776,7 +1776,7 @@
+ 			if (rc < 0) {
+ 				dev_err(chip->dev, "Keep boost vreg on failed, rc=%d\n",
+ 						rc);
+-				return rc;
++				goto out_not_playing;
+ 			}
+ 		} else {
+ 			hrtimer_start(&chip->hbst_off_timer,
+@@ -2872,9 +2872,31 @@
+ 		if (!chip->chip_effect_loaded)
+ 			dev_warn(chip->dev, "Trying to playback while no effect is loaded!\n");
+ 
++		/*
++		 * Re-enable the haptics rail per play, not just per upload.
++		 * haptics_stop_constant_effect_play() drops the rail every
++		 * time a play ends, so a client that uploads once and plays
++		 * many times runs every play after the first with the rail
++		 * down. haptics_enable_hpwr_vreg() is a no-op when the rail
++		 * is already in the requested state.
++		 */
++		rc = haptics_enable_hpwr_vreg(chip, true);
++		if (rc < 0) {
++			dev_err(chip->dev, "enable hpwr_vreg for play failed, rc=%d\n",
++					rc);
++			return rc;
++		}
++
+ 		rc = haptics_enable_play(chip, true);
+-		if (rc < 0)
++		if (rc < 0) {
++			/*
++			 * Play never started, so stop_work was never armed.
++			 * Drop the rail again here or it stays energized until
++			 * an erase or a teardown path happens to run.
++			 */
++			haptics_enable_hpwr_vreg(chip, false);
+ 			return rc;
++		}
+ 
+ 		/*
+ 		 * Arm the stop here, once playback has actually started, so
+@@ -2939,6 +2961,7 @@
+ 	}
+ 
+ 	chip->chip_effect_loaded = false;
++	chip->constant_replay_ms = 0;
+ 
+ 	mutex_unlock(&play->lock);
+ 

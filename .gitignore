@@ -30,3 +30,11 @@
 *.swp
 *.tmp
 __pycache__/
+
+# Personal opencode notes. This repo is public (thorch-os/thorch), and these
+# hold real hostnames, LAN IPs, and debugging history that must not be
+# published. Keep them on disk, out of the index.
+laptop-remote-opencode-setup.txt
+qwen3.8-opencode-setup.txt
+docs/my-thorch-build-notes.md
+docs/my-thorch-test-plan.md

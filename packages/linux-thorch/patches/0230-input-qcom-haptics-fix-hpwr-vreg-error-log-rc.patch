@@ -1,0 +1,49 @@
+From: Thorch contributors
+Subject: [PATCH] input: qcom-hv-haptics: fix missing rc in hpwr_vreg error logs
+
+Two haptics_enable_hpwr_vreg() failure sites log a %d conversion with no
+argument to match it. sweep_run_store() is one:
+
+	rc = haptics_enable_hpwr_vreg(chip, false);
+	if (rc < 0)
+		dev_err(chip->dev, "disable hpwr_vreg failed\n");
+
+gcc reports -Wformat= here, and with no argument the conversion reads an
+uninitialised register on the variadic path, so the message prints
+garbage. This one sits on the manual sweep path, which is the sweep used
+to exercise the actuator on the Thor, so a rail failure during a sweep
+logged nothing usable.
+
+haptics_stop_constant_effect_play() has the same defect one function
+above, on the log this patch series leans on hardest: that work runs
+after every bounded play, so a rail failure there logged a bare message
+with a garbage number. Fix it in the same commit, since both are the same
+one-token mistake and a sweep failure and a per-play stop failure are the
+same class of event to whoever reads the log.
+
+The other haptics_enable_hpwr_vreg() failure sites in this driver all
+pass rc. These two were missed. Pass rc at both, matching the siblings.
+---
+ drivers/input/misc/qcom-hv-haptics.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+--- a/drivers/input/misc/qcom-hv-haptics.c
++++ b/drivers/input/misc/qcom-hv-haptics.c
+@@ -2698,7 +2698,7 @@
+ 
+ 	rc = haptics_enable_hpwr_vreg(chip, false);
+ 	if (rc < 0)
+-		dev_err(chip->dev, "disable hpwr_vreg failed\n");
++		dev_err(chip->dev, "disable hpwr_vreg failed, rc=%d\n", rc);
+ }
+ 
+ static int haptics_upload_effect(struct input_dev *dev,
+@@ -5838,7 +5838,7 @@
+ 
+ 	rc = haptics_enable_hpwr_vreg(chip, false);
+ 	if (rc < 0)
+-		dev_err(chip->dev, "disable hpwr_vreg failed, rc=%d\n");
++		dev_err(chip->dev, "disable hpwr_vreg failed, rc=%d\n", rc);
+ 
+ 	return count;
+ }

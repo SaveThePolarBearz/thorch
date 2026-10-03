@@ -373,6 +373,12 @@ thor_board_dts="${source_abs}/arch/arm64/boot/dts/qcom/qcs8550-ayn-thor.dts"
   die "missing final ROCKNIX Thor DTS: ${thor_board_dts}"
 grep -Fq 'axis-range = <1024>;' "${thor_board_dts}" ||
   die "final ROCKNIX Thor DTS does not advertise the calibrated 1024-count stick range"
+# A re-set qcom,use-erm silences the haptics motor without any userspace
+# error, because the driver still accepts every upload and play request.
+# The driver reads the flag with of_property_read_bool(), which tests
+# presence, not value, so the property must be deleted, not zeroed.
+grep -Fq '/delete-property/ qcom,use-erm;' "${thor_board_dts}" ||
+  die "final ROCKNIX Thor DTS does not clear the haptics ERM flag for Thor's LRA"
 
 if [[ "${skip_kernel_patches}" -eq 0 ]]; then
   printf '%s\n' "${patch_input_digest}" > "${patch_marker}"
