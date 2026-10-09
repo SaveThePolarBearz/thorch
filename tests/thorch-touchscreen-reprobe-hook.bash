@@ -54,9 +54,30 @@ run_hook() {
   THORCH_TOUCH_SYSFS_ROOT="${sys}" \
   THORCH_TOUCH_REPROBE_DELAY=0 \
   PATH="${tmp}:${PATH}" \
-    "${hook}" "${3:-post}" suspend s2idle
+    "${hook_under_test}" "${3:-post}" suspend s2idle
 }
 
+# A real sysfs attribute sees every echo as a separate write, but a regular
+# fake file keeps only the last one. Run a copy of the hook whose redirects
+# append, so each fake attribute records every write the hook performs.
+hook_under_test="${tmp}/hook-under-test"
+sed -e 's#> "\${drv}/unbind"#>> "${drv}/unbind"#' \
+    -e 's#> "\${drv}/bind"#>> "${drv}/bind"#' "${hook}" > "${hook_under_test}"
+chmod 755 "${hook_under_test}"
+cmp -s "${hook}" "${hook_under_test}" &&
+  fail "append rewrite did not change the hook; test would be vacuous"
+
+# Both controllers must be re-probed. Each device is checked individually so a
+# regression that skips either panel cannot pass.
+assert_both_reprobed() {
+  local why="$1" attr dev
+  for attr in unbind bind; do
+    for dev in 1-0038 4-0038; do
+      [[ "$(grep -cx "${dev}" "${sys}/bus/i2c/drivers/edt_ft5x06/${attr}")" == 1 ]] ||
+        fail "${attr} not written exactly once for ${dev} ${why}"
+    done
+  done
+}
 # Case 1: healthy registers (1080/1080) -> no unbind/bind.
 : > "${sys}/bus/i2c/drivers/edt_ft5x06/unbind"
 : > "${sys}/bus/i2c/drivers/edt_ft5x06/bind"
@@ -70,28 +91,19 @@ run_hook 1080 1080
 : > "${sys}/bus/i2c/drivers/edt_ft5x06/unbind"
 : > "${sys}/bus/i2c/drivers/edt_ft5x06/bind"
 run_hook 1024 1024
-grep -qx '4-0038' "${sys}/bus/i2c/drivers/edt_ft5x06/unbind" ||
-  fail "unbind not written on corrupted touchscreens"
-grep -qx '4-0038' "${sys}/bus/i2c/drivers/edt_ft5x06/bind" ||
-  fail "bind not written on corrupted touchscreens"
+assert_both_reprobed "on corrupted touchscreens"
 
 # Case 3: only one screen corrupted -> still re-probes both.
 : > "${sys}/bus/i2c/drivers/edt_ft5x06/unbind"
 : > "${sys}/bus/i2c/drivers/edt_ft5x06/bind"
 run_hook 1024 1080
-grep -qx '4-0038' "${sys}/bus/i2c/drivers/edt_ft5x06/unbind" ||
-  fail "unbind not written when only top screen corrupted"
-grep -qx '4-0038' "${sys}/bus/i2c/drivers/edt_ft5x06/bind" ||
-  fail "bind not written when only top screen corrupted"
+assert_both_reprobed "when only top screen corrupted"
 
 # Case 4: debugfs unavailable (cat fails) -> re-probes anyway.
 : > "${sys}/bus/i2c/drivers/edt_ft5x06/unbind"
 : > "${sys}/bus/i2c/drivers/edt_ft5x06/bind"
 run_hook "" ""
-grep -qx '4-0038' "${sys}/bus/i2c/drivers/edt_ft5x06/unbind" ||
-  fail "unbind not written when debugfs unavailable"
-grep -qx '4-0038' "${sys}/bus/i2c/drivers/edt_ft5x06/bind" ||
-  fail "bind not written when debugfs unavailable"
+assert_both_reprobed "when debugfs unavailable"
 
 # Case 5: no touchscreens bound -> no action.
 mv "${sys}/bus/i2c/drivers/edt_ft5x06/1-0038" "${tmp}/gone-1"

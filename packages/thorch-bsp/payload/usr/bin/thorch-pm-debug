@@ -86,7 +86,12 @@ status() {
   fi
   printf 'pm_debug_messages=%s\n' "${value}"
   if have_dyndbg; then
-    if grep -q "file ${dyndbg_file} .*=p" "${dyndbg_control}" 2>/dev/null; then
+    # Reading the control file lists the catalog, one site per line:
+    #   <file>:<line> [<module>]<function> =<flags> "<format>"
+    # (the "file X +p" form is only the write syntax). A site is enabled when
+    # its flags contain "p".
+    if grep -F -- "${dyndbg_file}:" "${dyndbg_control}" 2>/dev/null |
+        grep -Eq ' =[^ ]*p'; then
       printf 'dyndbg %s=+p\n' "${dyndbg_file}"
     else
       printf 'dyndbg %s=-p\n' "${dyndbg_file}"

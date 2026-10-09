@@ -2,7 +2,7 @@
 
 pkgname=thorch-bsp
 pkgver=1
-pkgrel=43
+pkgrel=44
 pkgdesc='Thorch AYN Thor boot and board support package'
 arch=(aarch64)
 url='https://github.com/ROCKNIX/distribution'

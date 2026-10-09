@@ -23,15 +23,33 @@ grep -q "kernel_cmdline_has 'mem_sleep_default=s2idle'" "${image_checker}" ||
   fail "raw image validation does not enforce the s2idle kernel default"
 # The BSP must not install system-sleep hooks that touch hardware state
 # during the suspend transition (USB role, UFS clocks, CPU/GPU policy,
-# RGB). The one exception is 50-thorch-wifi-reassoc: it only acts after
-# resume (post), only when the WiFi link is down, and only touches
-# NetworkManager.
-if compgen -G "${sleep_hooks}/thorch-*" >/dev/null; then
-  for hook in "${sleep_hooks}"/thorch-*; do
-    [[ "$(basename "${hook}")" == "50-thorch-wifi-reassoc" ]] && continue
-    fail "BSP still installs a Thorch system-sleep hook: $(basename "${hook}")"
+# RGB). The shipped hooks are numbered (NN-thorch-*), so the guard has to
+# match that form. The allowed set is exact: each hook only acts after
+# resume (post) and its pre phase, if any, is a read-only snapshot. Adding a
+# hook requires a conscious update of this list.
+allowed_hooks=(
+  50-thorch-wifi-reassoc
+  51-thorch-touchscreen-reprobe
+  52-thorch-usb-reprobe
+)
+shopt -s nullglob
+installed_hooks=("${sleep_hooks}"/*)
+shopt -u nullglob
+[[ "${#installed_hooks[@]}" -gt 0 ]] ||
+  fail "no system-sleep hooks found under ${sleep_hooks}; guard would be vacuous"
+for hook in "${installed_hooks[@]}"; do
+  hook_name="$(basename "${hook}")"
+  known=0
+  for allowed in "${allowed_hooks[@]}"; do
+    [[ "${hook_name}" == "${allowed}" ]] && known=1
   done
-fi
+  [[ "${known}" -eq 1 ]] ||
+    fail "BSP installs an unreviewed system-sleep hook: ${hook_name}"
+done
+for allowed in "${allowed_hooks[@]}"; do
+  [[ -f "${sleep_hooks}/${allowed}" ]] ||
+    fail "expected system-sleep hook is missing: ${allowed}"
+done
 
 grep -q 'KERNEL=="a600000.usb"' "${usb_rule}" ||
   fail "USB autosuspend rule does not target the primary SM8550 controller"

@@ -49,9 +49,15 @@ grep -Fq "sed -i '/^\\[options\\]/a DisableSandboxFilesystem'" "${builder}" ||
 ! grep -Fq "sed -i '/^\\[options\\]/a DisableSandbox'" "${builder}" ||
   fail "image builder disables pacman's seccomp sandbox instead of only its unsupported Landlock sandbox"
 
-service_block="$(sed -n '/^rootfs_services=(/,/^)/p' "${builder}")"
-! grep -q 'sshd.service' <<< "${service_block}" ||
-  fail "image builder duplicates SSH policy in the static service inventory"
+# SSH is enabled only through the transient build preset, which must be
+# removed again before the image is finalized. (A static service inventory
+# such as rootfs_services=( ... ) must not come back.)
+! grep -q '^rootfs_services=(' "${builder}" ||
+  fail "image builder reintroduced a static service inventory"
+[[ "$(grep -c 'enable sshd.service' "${builder}")" == 1 ]] ||
+  fail "SSH enablement must appear exactly once, in the transient build preset"
+grep -q 'rm -f "${ssh_build_preset}"' "${builder}" ||
+  fail "image builder does not remove the transient SSH build preset"
 
 if grep -RInE 'default(ing|s)? to `?1234|THORCH_PASSWORD.*1234' \
   "${config}" "${builder}" "${root}/README.md" "${root}/docs" "${root}/SECURITY.md"; then
