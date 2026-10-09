@@ -52,12 +52,21 @@ rootfs_reusable() {
 }
 
 package_in_repo() {
-  local pkg="$1" match
+  local pkg="$1" expected match pkgver
   local -a matches=()
+
+  # Version-aware: an archive with the package name but a stale pkgver/pkgrel
+  # must not satisfy the skip. Otherwise `make fast` would pair old installed
+  # modules with a vendor kernel rebuilt for the new release.
+  expected="$(python3 "${manifest_cli}" --repo "${root}" version "${pkg}")" || return 1
+  [[ -n "${expected}" ]] || return 1
 
   shopt -s nullglob
   for match in "${repo_dir}/${pkg}-"*.pkg.tar.*; do
-    [[ "${match}" != *.sig ]] && matches+=("${match}")
+    [[ "${match}" != *.sig ]] || continue
+    pkgver="$(bsdtar -xOqf "${match}" .PKGINFO 2>/dev/null |
+      awk -F ' = ' '$1 == "pkgver" {print $2; exit}')"
+    [[ "${pkgver}" == "${expected}" ]] && matches+=("${match}")
   done
   shopt -u nullglob
   [[ "${#matches[@]}" -gt 0 ]]
@@ -83,10 +92,10 @@ packages_to_refresh=()
 for pkg in "${image_packages[@]}"; do
   if [[ "${pkg}" == "linux-thorch" && "${with_kernel}" -eq 0 ]]; then
     if package_in_repo "${pkg}"; then
-      log "skipping linux-thorch package refresh; use --with-kernel to rebuild it"
+      log "skipping linux-thorch package refresh; ${repo_dir} already has the expected version (use --with-kernel to rebuild it)"
       continue
     fi
-    warn "linux-thorch is missing from ${repo_dir}; building it once so the image can be assembled"
+    warn "linux-thorch is stale or missing in ${repo_dir}; rebuilding it once so the image can be assembled"
   fi
   packages_to_refresh+=("${pkg}")
 done

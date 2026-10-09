@@ -360,6 +360,20 @@ verify_image_package_versions() {
     [[ "${installed}" == "${package} ${expected}" ]] ||
       die "installed ${installed:-missing ${package}}, expected local ${package} ${expected}"
   done
+
+  # The imported kernel artifacts and the installed linux-thorch package must
+  # describe the same kernel release. Otherwise `make fast` can skip a stale
+  # linux-thorch package after the vendor kernel was rebuilt for a new pkgrel,
+  # producing an image whose installed modules do not match /boot/KERNEL.
+  local expected_kernel_release expected_kernel_version installed_kernel modules_dir
+  expected_kernel_version="$(python3 "${manifest_cli}" --repo "${root}" version linux-thorch)"
+  expected_kernel_release="$(linux_thorch_expected_kernel_release)"
+  installed_kernel="$(run_rootfs_cmd /usr/bin/pacman -Q -- linux-thorch | strip_control_output)"
+  [[ "${installed_kernel}" == "linux-thorch ${expected_kernel_version}" ]] ||
+    die "installed ${installed_kernel:-missing linux-thorch}, expected linux-thorch ${expected_kernel_version} (imported kernel is ${expected_kernel_release})"
+  modules_dir="${rootfs_dir}/usr/lib/modules/${expected_kernel_release}"
+  [[ -f "${modules_dir}/modules.dep" ]] ||
+    die "installed linux-thorch has no module tree for ${expected_kernel_release}; rebuild the kernel package and the image packages together"
 }
 
 install_image_packages() {
