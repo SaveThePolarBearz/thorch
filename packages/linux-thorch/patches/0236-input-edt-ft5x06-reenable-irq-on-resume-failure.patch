@@ -1,0 +1,51 @@
+From: Thorch contributors
+Subject: [PATCH] input: edt-ft5x06: keep the IRQ enabled when resume re-init fails
+
+edt_ft5x06_ts_resume() disables the controller IRQ before re-running the
+probe-time initialization, but the re-identify failure path returns
+immediately:
+
+	ret = edt_ft5x06_ts_identify(client, tsdata);
+	if (ret) {
+		dev_err(dev, "touchscreen re-identify failed\n");
+		return ret;
+	}
+
+The IRQ was disabled just above on retain-power boards (0019) and in the
+suspend path on every other board, so that return skips enable_irq() and
+leaves it disabled: the touchscreen stays dead until
+51-thorch-touchscreen-reprobe unbinds/rebinds the controller or the device
+reboots. Route the failure through a label that enables the IRQ first.
+
+Fixes: 0019-input-edt-ft5x06-reinit-on-resume.patch
+---
+ drivers/input/touchscreen/edt-ft5x06.c | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+---
+--- a/drivers/input/touchscreen/edt-ft5x06.c
++++ b/drivers/input/touchscreen/edt-ft5x06.c
+@@ -77,7 +77,7 @@ static int edt_ft5x06_ts_resume(struct device *dev)
+ 		ret = edt_ft5x06_ts_identify(client, tsdata);
+ 		if (ret) {
+ 			dev_err(dev, "touchscreen re-identify failed\n");
+-			return ret;
++			goto out_enable_irq;
+ 		}
+ 
+ 		/*
+@@ -91,6 +91,15 @@ static int edt_ft5x06_ts_resume(struct device *dev)
+ 		edt_ft5x06_ts_get_defaults(&client->dev, tsdata);
+ 		edt_ft5x06_ts_get_parameters(tsdata);
+ 		edt_ft5x06_restore_reg_parameters(tsdata);
++
++out_enable_irq:
++		/*
++		 * A failed re-identify lands here instead of returning
++		 * straight away: the IRQ was disabled above on retain-power
++		 * boards and in the suspend path on every other board, so
++		 * skipping enable_irq() leaves the controller dead until a
++		 * re-probe or a reboot.
++		 */
+ 		enable_irq(tsdata->client->irq);
+ 	}
+ 

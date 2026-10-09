@@ -33,9 +33,10 @@ if error in callback) only covers a failing register/unregister, not
 this force-unregister, so the desync is still reachable.
 
 Take vblank_ctl_lock and drive the count to zero in the same place the
-callback is dropped, so the enable-side path can register again.  The
-callback is dropped whether or not the unregister itself reports an
-error, so the count follows unconditionally.
+callback is dropped, so the enable-side path can register again.  Drive it
+down only when dpu_core_irq_unregister_callback() reports success: it
+returns int, and zeroing the count while a failed unregister left the
+callback installed would desynchronise the count from the callback.
 
 Observed on AYN Thor (SM8550, DSI-2 1080x1920@120Hz, enc38) as an
 intermittent top-panel stall across the idle -> active edge of the
@@ -50,11 +51,11 @@ the stall, so the behavioural claim above comes from the device
 journal signature, not from a before/after run.
 
 ---
- drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c | 22 +++++++++++++++++++++--
- 1 file changed, 20 insertions(+), 2 deletions(-)
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c | 24 +++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
 --- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
 +++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
-@@ -163,6 +163,25 @@
+@@ -163,6 +163,27 @@
  	phys_enc->irq[INTR_IDX_UNDERRUN] = phys_enc->hw_intf->cap->intr_underrun;
  }
  
@@ -62,15 +63,17 @@ journal signature, not from a before/after run.
 +		struct dpu_encoder_phys *phys_enc)
 +{
 +	mutex_lock(&phys_enc->vblank_ctl_lock);
-+	if (phys_enc->vblank_refcount > 0) {
-+		dpu_core_irq_unregister_callback(phys_enc->dpu_kms,
-+				phys_enc->irq[INTR_IDX_RDPTR]);
++	if (phys_enc->vblank_refcount > 0 &&
++			!dpu_core_irq_unregister_callback(phys_enc->dpu_kms,
++				phys_enc->irq[INTR_IDX_RDPTR])) {
 +		/*
-+		 * The callback is gone whether or not the unregister above
-+		 * reported an error, so the count has to follow it down.
-+		 * Leaving it set makes the next enable-side
-+		 * control_vblank_irq(true) skip registration, since it only
-+		 * registers on a 0 -> 1 transition.
++		 * Only a successful unregister means the callback is really
++		 * gone. It is the callback that owns the reference
++		 * control_vblank_irq() counts, so clear the count only when
++		 * the unregister dropped it: leaving a stale count makes the
++		 * next enable-side registration skip, but zeroing it while
++		 * the callback is still installed would desynchronise the
++		 * two.
 +		 */
 +		phys_enc->vblank_refcount = 0;
 +	}

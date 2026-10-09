@@ -7,7 +7,7 @@ after the ROCKNIX vendor driver patches have been applied:
     1002-haptics-driver-support-periodic-sine-and-fixes.patch
 
 It is **not** edited by anything in this repo. It exists so the Thor
-haptics patch chain in `packages/linux-thorch/patches/0225` through `0230`
+haptics patch chain in `packages/linux-thorch/patches/0225` through `0238`
 can be applied and asserted on in CI, which never runs `make sync` and so
 never has the gitignored `vendor/rocknix-sm8550/` tree. Without this,
 `tests/thorch-kernel-features.bash` skipped every behavioral haptics

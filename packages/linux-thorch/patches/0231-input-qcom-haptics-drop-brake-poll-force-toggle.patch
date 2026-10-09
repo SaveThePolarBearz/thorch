@@ -45,16 +45,17 @@ out on the first poll roughly 2.4 ms into every stop and truncate the
 brake pattern rather than wait for it.
 
 Keep the recovery toggle only for states that are neither HPWR_DISABLED
-nor HPWR_READY, which is what a genuinely wedged block looks like, and
-drop the warning for the powered-idle case since it is the expected
-outcome on an hBoost rail rather than an error.
+nor HPWR_READY, which is what a genuinely wedged block looks like. Keep a
+warning when the toggle actually fires so the recovery event stays
+visible, and drop the warning for the powered-idle case since it is the
+expected outcome on an hBoost rail rather than an error.
 ---
- drivers/input/misc/qcom-hv-haptics.c | 5 +++--
- 1 file changed, 3 insertions(+), 2 deletions(-)
-
+ drivers/input/misc/qcom-hv-haptics.c | 6 ++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+---
 --- a/drivers/input/misc/qcom-hv-haptics.c
 +++ b/drivers/input/misc/qcom-hv-haptics.c
-@@ -1722,10 +1722,11 @@ static int haptics_wait_brake_complete(struct haptics_chip *chip)
+@@ -1722,10 +1722,13 @@ static int haptics_wait_brake_complete(struct haptics_chip *chip)
  		dev_dbg(chip->dev, "polling HPWR_INTF timeout %d, value = %d\n",
  				timeout, val);
  	} while (--timeout);
@@ -62,9 +63,11 @@ outcome on an hBoost rail rather than an error.
  	if (timeout == 0) {
 -		dev_warn(chip->dev, "poll HPWR_DISABLED failed after stopped play\n");
 -		return haptics_toggle_module_enable(chip);
-+		dev_dbg(chip->dev, "HPWR_INTF still %d after stopped play, not toggling\n", val);
-+		if ((val & HPWR_INTF_STATUS_MASK) != HPWR_READY)
++		if ((val & HPWR_INTF_STATUS_MASK) != HPWR_READY) {
++			dev_warn(chip->dev, "poll HPWR_DISABLED failed after stopped play, value = %d; toggling HAPTICS_EN\n", val);
 +			return haptics_toggle_module_enable(chip);
++		}
++		dev_dbg(chip->dev, "HPWR_INTF still %d after stopped play (hBoost rail)\n", val);
  	}
  
  	return 0;

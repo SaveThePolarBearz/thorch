@@ -1,0 +1,30 @@
+From: Thorch contributors
+Subject: [PATCH] input: qcom-hv-haptics: report rc when the per-play stop fails
+
+haptics_stop_constant_effect_play() runs after every bounded FF_CONSTANT
+play, but its failure log drops rc:
+
+	rc = haptics_enable_play(chip, false);
+	if (rc < 0)
+		dev_err(chip->dev, "stop constant effect play failed\n");
+
+That is the same defect 0230 fixed at the other rail sites; without rc the
+one line that explains why a stop failed is useless for diagnosis. Report
+it and assert the rc-bearing form in the regression test.
+
+Fixes: 0230-input-qcom-haptics-fix-hpwr-vreg-error-log-rc.patch
+---
+ drivers/input/misc/qcom-hv-haptics.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+---
+--- a/drivers/input/misc/qcom-hv-haptics.c
++++ b/drivers/input/misc/qcom-hv-haptics.c
+@@ -2697,7 +2697,7 @@ static void haptics_stop_constant_effect_play(struct work_struct *work)
+ 
+ 	rc = haptics_enable_play(chip, false);
+ 	if (rc < 0)
+-		dev_err(chip->dev, "stop constant effect play failed\n");
++		dev_err(chip->dev, "stop constant effect play failed, rc=%d\n", rc);
+ 
+ 	rc = haptics_enable_hpwr_vreg(chip, false);
+ 	if (rc < 0)

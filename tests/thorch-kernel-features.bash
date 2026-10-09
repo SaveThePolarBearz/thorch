@@ -18,6 +18,9 @@ haptics_ff_rail_patch="${root}/packages/linux-thorch/patches/0228-input-qcom-hap
 haptics_lra_cal_patch="${root}/packages/linux-thorch/patches/0229-input-qcom-haptics-drop-lra-boot-cal-retries.patch"
 haptics_sweep_log_patch="${root}/packages/linux-thorch/patches/0230-input-qcom-haptics-fix-hpwr-vreg-error-log-rc.patch"
 haptics_brake_toggle_patch="${root}/packages/linux-thorch/patches/0231-input-qcom-haptics-drop-brake-poll-force-toggle.patch"
+haptics_ff_defer_patch="${root}/packages/linux-thorch/patches/0237-input-qcom-haptics-defer-ff-hardware-to-workqueue.patch"
+haptics_stop_log_patch="${root}/packages/linux-thorch/patches/0238-input-qcom-haptics-report-rc-on-stop-constant-failure.patch"
+edt_resume_irq_patch="${root}/packages/linux-thorch/patches/0236-input-edt-ft5x06-reenable-irq-on-resume-failure.patch"
 haptics_driver_base_patch="${root}/vendor/rocknix-sm8550/patches/linux/1000-add-qcom-haptics-driver.patch"
 haptics_driver_sine_patch="${root}/vendor/rocknix-sm8550/patches/linux/1002-haptics-driver-support-periodic-sine-and-fixes.patch"
 # Post-vendor-patch snapshot of the haptics driver, tracked so the Thor chain
@@ -108,6 +111,14 @@ grep -Fq 'final ROCKNIX Thor DTS does not clear the haptics ERM flag' "${build_s
   fail "Thor haptics sweep_run_store rc log patch is missing"
 [[ -f "${haptics_brake_toggle_patch}" ]] ||
   fail "Thor haptics brake poll force-toggle patch is missing"
+[[ -f "${haptics_ff_defer_patch}" ]] ||
+  fail "Thor haptics deferred FF work patch is missing"
+[[ -f "${haptics_stop_log_patch}" ]] ||
+  fail "Thor haptics per-play stop rc log patch is missing"
+[[ -f "${edt_resume_irq_patch}" ]] ||
+  fail "Thor touchscreen resume IRQ balance patch is missing"
+git apply --numstat -- "${edt_resume_irq_patch}" >/dev/null 2>&1 ||
+  fail "Thor touchscreen resume IRQ balance patch is malformed"
 
 # The FF stop-path fixes are verified against the real patched driver, not
 # against the patch text. Grepping a diff cannot distinguish an applied hunk
@@ -134,7 +145,9 @@ for patch in \
   "${haptics_ff_rail_patch}" \
   "${haptics_lra_cal_patch}" \
   "${haptics_sweep_log_patch}" \
-  "${haptics_brake_toggle_patch}"; do
+  "${haptics_brake_toggle_patch}" \
+  "${haptics_ff_defer_patch}" \
+  "${haptics_stop_log_patch}"; do
   git -C "${haptics_scratch}" apply \
     --include="${haptics_driver_rel}" -- "${patch}" ||
     fail "haptics patch chain does not apply: ${patch}"
@@ -153,7 +166,9 @@ if [[ -f "${haptics_driver_base_patch}" && -f "${haptics_driver_sine_patch}" ]];
     "${haptics_ff_rail_patch}" \
     "${haptics_lra_cal_patch}" \
     "${haptics_sweep_log_patch}" \
-    "${haptics_brake_toggle_patch}"; do
+    "${haptics_brake_toggle_patch}" \
+    "${haptics_ff_defer_patch}" \
+    "${haptics_stop_log_patch}"; do
     git -C "${haptics_vendor_scratch}" apply \
       --include="${haptics_driver_rel}" -- "${patch}" ||
       fail "haptics patch chain does not apply against vendor: ${patch}"
@@ -165,9 +180,28 @@ else
   printf 'NOTE: vendor/rocknix-sm8550 absent, skipped the fixture-drift cross-check\n'
 fi
 
-grep -Fq 'if (!val && chip->chip_is_playing)' "${haptics_src}" ||
-  fail "patched haptics driver does not gate the stop on chip_is_playing"
-grep -Fq 'return haptics_enable_play(chip, false);' "${haptics_src}" ||
+# ff-core calls ff_device.playback() under dev->event_lock with interrupts
+# disabled, so haptics_playback() must not touch regulators, poll the brake
+# pattern, or stop the motor inline. It records the request and
+# haptics_ff_work() runs the hardware sequencing in process context. See
+# 0237.
+haptics_playback_body="$(awk '/^static int haptics_playback\(/,/^}/' "${haptics_src}")"
+[[ -n "${haptics_playback_body}" ]] ||
+  fail "patched haptics driver has no haptics_playback() to inspect"
+printf '%s\n' "${haptics_playback_body}" |
+  grep -Fq 'schedule_work(&chip->ff_work);' ||
+  fail "patched haptics driver does not defer FF hardware work to the workqueue"
+if printf '%s\n' "${haptics_playback_body}" |
+  grep -Eq 'haptics_enable_(play|hpwr_vreg)\('; then
+  fail "patched haptics driver still runs hardware work inside the atomic FF callback"
+fi
+grep -Fq 'atomic_read(&chip->ff_request) > 0' "${haptics_src}" ||
+  fail "patched haptics driver can lose a stop request while a play is still pending"
+haptics_ff_work_body="$(awk '/^static void haptics_ff_work\(/,/^}/' "${haptics_src}")"
+[[ -n "${haptics_ff_work_body}" ]] ||
+  fail "patched haptics driver has no haptics_ff_work() to inspect"
+printf '%s\n' "${haptics_ff_work_body}" |
+  grep -Fq 'haptics_enable_play(chip, false);' ||
   fail "patched haptics driver does not stop playback on a stop request"
 grep -Fq 'chip->constant_replay_ms = length_ms;' "${haptics_src}" ||
   fail "patched haptics driver does not remember the constant replay length"
@@ -209,33 +243,33 @@ fi
 grep -Fq 'dev_err(chip->dev, "disable hpwr_vreg failed, rc=%d\n", rc);' "${haptics_src}" ||
   fail "patched haptics driver does not report rc in the sweep rail error log"
 # The per-play stop work is the other rail-drop site and runs after every
-# bounded play, so its failure log matters just as much.
-grep -B 1 -Fq 'dev_err(chip->dev, "stop constant effect play failed");' "${haptics_src}" &&
+# bounded play, so its failure log matters just as much. It must report rc,
+# and the old no-rc form must be gone. See 0238.
+if grep -Fq 'dev_err(chip->dev, "stop constant effect play failed\n");' "${haptics_src}"; then
   fail "patched haptics driver does not report rc when the per-play stop fails"
+fi
+grep -Fq 'dev_err(chip->dev, "stop constant effect play failed, rc=%d\n", rc);' "${haptics_src}" ||
+  fail "patched haptics driver does not report rc in the per-play stop error log"
 # The rail is dropped on every stop, so an upload-once/play-many client needs
-# it restored per play. See 0228.
+# it restored per play. See 0228; 0237 moved the sequencing into the worker.
 grep -Fq 'enable hpwr_vreg for play failed' "${haptics_src}" ||
   fail "patched haptics driver does not restore the haptics rail per play"
-grep -A 2 -Fq 'haptics_enable_hpwr_vreg(chip, true);' "${haptics_src}" ||
-  fail "patched haptics driver has no per-play hpwr_vreg enable"
+printf '%s\n' "${haptics_ff_work_body}" |
+  grep -Fq 'haptics_enable_hpwr_vreg(chip, true);' ||
+  fail "patched haptics driver does not restore the rail inside haptics_ff_work()"
 # Play never started on the enable_play() failure path, so stop_work was
-  # never armed and nothing would turn the rail back off. Assert the rail is
-  # dropped again on that path or a persistently failing play leaves the rail
-  # energized until an erase or teardown happens to run. See 0228.
-  #
-  # Scoped to haptics_playback() on purpose: the same enable_play() call
-  # appears in the calibration and sweep helpers, and a whole-file grep with
-  # -A would anchor on whichever comes first, which is not the path under test.
-  haptics_playback_body="$(awk '/^static int haptics_playback\(/,/^}/' "${haptics_src}")"
-  [[ -n "${haptics_playback_body}" ]] ||
-    fail "patched haptics driver has no haptics_playback() to inspect"
-  printf '%s\n' "${haptics_playback_body}" |
-    grep -Fq 'haptics_enable_hpwr_vreg(chip, true);' ||
-    fail "patched haptics driver does not restore the rail inside haptics_playback()"
-  if ! printf '%s\n' "${haptics_playback_body}" |
-    awk '/rc = haptics_enable_play\(chip, true\);/{f=1} f&&/haptics_enable_hpwr_vreg\(chip, false\);/{found=1} END{exit !found}'; then
-    fail "patched haptics driver leaks the haptics rail when a play fails to start"
-  fi
+# never armed and nothing would turn the rail back off. Assert the rail is
+# dropped again on that path or a persistently failing play leaves the rail
+# energized until an erase or teardown happens to run. Scoped to
+# haptics_ff_work() because the same enable_play() call appears in the
+# calibration and sweep helpers. See 0228.
+if ! printf '%s\n' "${haptics_ff_work_body}" |
+  awk '/rc = haptics_enable_play\(chip, true\);/{f=1} f&&/haptics_enable_hpwr_vreg\(chip, false\);/{found=1} END{exit !found}'; then
+  fail "patched haptics driver leaks the haptics rail when a play fails to start"
+fi
+printf '%s\n' "${haptics_ff_work_body}" |
+  grep -Fq 'mod_delayed_work(system_percpu_wq,' ||
+  fail "patched haptics driver does not arm the stop timer from the FF worker"
 # On this board hBoost holds the rail at HPWR_READY, so the brake poll can
 # never observe HPWR_DISABLED and always ran out its budget. Force-toggling
 # HAPTICS_EN there power-cycled the block on most taps, which is what the

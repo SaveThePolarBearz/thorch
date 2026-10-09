@@ -1,0 +1,237 @@
+From: Thorch contributors
+Subject: [PATCH] input: qcom-hv-haptics: do FF play/stop hardware work in process context
+
+ff-core invokes ff_device.playback() from input_ff_event() and from
+erase_effect(), both under dev->event_lock with interrupts disabled
+(input_event()/input_inject_event() take spinlock_irqsave; erase_effect()
+takes spinlock_irq). 0225 and 0228 moved real hardware work into that
+callback: 0228 enables the haptics regulator, and 0225 runs the stop
+path, which polls the brake pattern with udelay() and may toggle
+HAPTICS_EN. Regulator operations take mutexes and can sleep, and the
+brake poll busy-waits on every stop, so both are illegal or at best
+dangerous under the input event lock.
+
+Record the request in haptics_playback() and move the hardware
+sequencing into a work item, haptics_ff_work(), which runs in process
+context and takes play.lock so it stays serialized with upload and
+erase. The request is a small atomic state: a play followed by a stop
+coalesces to the stop, and a request arriving while the work is running
+re-queues it, so no transition is lost.
+
+The repeated rail enable, enable_play(), stop_work arming, and the
+immediate stop move into the worker unchanged. haptics_erase() cancels
+the work before taking play.lock; cancel_work_sync() would otherwise
+wait for a worker blocked on the mutex the erase path holds.
+haptics_remove() cancels it at teardown.
+
+Behavioural cost: a play or stop request is now serviced by the
+workqueue (millisecond-scale) instead of inline, which is within what
+the asynchronous FF API allows. Hardware behaviour is otherwise
+unchanged. This patch is compile- and hardware-untested at authoring
+time; verify with the LRA before shipping.
+
+Fixes: 0225-input-qcom-haptics-fix-ff-stop-path.patch
+Fixes: 0228-input-qcom-haptics-restore-hpwr-vreg-per-play.patch
+---
+ drivers/input/misc/qcom-hv-haptics.c | 92 ++++++++++++++++++++++++++-----------
+ 1 file changed, 91 insertions(+), 52 deletions(-)
+---
+--- a/drivers/input/misc/qcom-hv-haptics.c
++++ b/drivers/input/misc/qcom-hv-haptics.c
+@@ -621,6 +621,7 @@ struct haptics_chip {
+ 	struct haptics_mmap		mmap;
+ 	struct dentry			*debugfs_dir;
+ 	struct delayed_work		stop_work;
++	struct work_struct		ff_work;
+ 	struct regulator_dev		*swr_slave_rdev;
+ 	struct nvmem_cell		*cl_brake_nvmem;
+ 	struct nvmem_device		*hap_cfg_nvmem;
+@@ -634,6 +635,7 @@ struct haptics_chip {
+ 
+ 	volatile bool			chip_effect_loaded;
+ 	volatile bool			chip_is_playing;
++	atomic_t			ff_request;
+ 	u32				constant_replay_ms;
+ 	int				fifo_empty_irq;
+ 	u32				hpwr_voltage_mv;
+@@ -2861,70 +2863,97 @@ static int haptics_upload_effect(struct input_dev *dev,
+ 	return 0;
+ }
+ 
++static void haptics_ff_work(struct work_struct *work)
++{
++	struct haptics_chip *chip = container_of(work, struct haptics_chip,
++			ff_work);
++	int rc, request;
++
++	for (;;) {
++		request = atomic_xchg(&chip->ff_request, 0);
++		if (request == 0)
++			return;
++
++		mutex_lock(&chip->play.lock);
++
++		if (request > 0 && !chip->chip_is_playing) {
++			/*
++			 * Re-enable the haptics rail per play, not just per
++			 * upload: haptics_stop_constant_effect_play() drops the
++			 * rail every time a play ends, so a client that uploads
++			 * once and plays many times runs every play after the
++			 * first with the rail down. haptics_enable_hpwr_vreg()
++			 * is a no-op when the rail is already in the requested
++			 * state.
++			 */
++			rc = haptics_enable_hpwr_vreg(chip, true);
++			if (rc < 0) {
++				dev_err(chip->dev, "enable hpwr_vreg for play failed, rc=%d\n",
++						rc);
++			} else {
++				rc = haptics_enable_play(chip, true);
++				if (rc < 0) {
++					/*
++					 * Play never started, so stop_work was never
++					 * armed. Drop the rail again or it stays
++					 * energized until an erase or a teardown
++					 * path happens to run.
++					 */
++					haptics_enable_hpwr_vreg(chip, false);
++				} else if (chip->constant_replay_ms > 0) {
++					/*
++					 * Arm the stop once playback has actually
++					 * started, so every play is bounded by the
++					 * effect's own replay length.
++					 * mod_delayed_work(), not
++					 * schedule_delayed_work(): the latter leaves an
++					 * already pending timer at its old deadline, so a
++					 * tap arriving before the previous stop fires
++					 * would inherit that deadline and be cut short.
++					 * system_percpu_wq is the queue
++					 * schedule_delayed_work() resolves to on this
++					 * tree.
++					 */
++					mod_delayed_work(system_percpu_wq, &chip->stop_work,
++							msecs_to_jiffies(chip->constant_replay_ms));
++				}
++			}
++		} else if (request < 0 && chip->chip_is_playing) {
++			haptics_enable_play(chip, false);
++		}
++
++		mutex_unlock(&chip->play.lock);
++	}
++}
++
+ static int haptics_playback(struct input_dev *dev, int effect_id, int val)
+ {
+ 	struct haptics_chip *chip = input_get_drvdata(dev);
++	int request = 0;
+ 
+ 	dev_dbg(chip->dev, "playback val = %d\n", val);
+ 
++	/*
++	 * ff-core calls playback() for EV_FF writes and effect erases under
++	 * dev->event_lock with interrupts disabled, so this callback must not
++	 * touch regulators, poll for the brake pattern, or sleep. Record the
++	 * request and let haptics_ff_work() do the hardware sequencing in
++	 * process context.
++	 */
+ 	if (!!val && !chip->chip_is_playing) {
+-		int rc;
+-
+ 		if (!chip->chip_effect_loaded)
+ 			dev_warn(chip->dev, "Trying to playback while no effect is loaded!\n");
++		request = 1;
++	} else if (!val && (chip->chip_is_playing ||
++			atomic_read(&chip->ff_request) > 0)) {
++		request = -1;
++	}
+ 
+-		/*
+-		 * Re-enable the haptics rail per play, not just per upload.
+-		 * haptics_stop_constant_effect_play() drops the rail every
+-		 * time a play ends, so a client that uploads once and plays
+-		 * many times runs every play after the first with the rail
+-		 * down. haptics_enable_hpwr_vreg() is a no-op when the rail
+-		 * is already in the requested state.
+-		 */
+-		rc = haptics_enable_hpwr_vreg(chip, true);
+-		if (rc < 0) {
+-			dev_err(chip->dev, "enable hpwr_vreg for play failed, rc=%d\n",
+-					rc);
+-			return rc;
+-		}
+-
+-		rc = haptics_enable_play(chip, true);
+-		if (rc < 0) {
+-			/*
+-			 * Play never started, so stop_work was never armed.
+-			 * Drop the rail again here or it stays energized until
+-			 * an erase or a teardown path happens to run.
+-			 */
+-			haptics_enable_hpwr_vreg(chip, false);
+-			return rc;
+-		}
+-
+-		/*
+-		 * Arm the stop here, once playback has actually started, so
+-		 * every play is bounded by the effect's own replay length.
+-		 * Without this a client that uploads one effect and plays it
+-		 * many times runs the motor until something else stops it.
+-		 *
+-		 * mod_delayed_work(), not schedule_delayed_work(): the latter
+-		 * leaves an already pending timer at its old deadline instead
+-		 * of re-arming it, so a tap that arrives before the previous
+-		 * stop fires inherits that stop's deadline and is cut short.
+-		 *
+-		 * system_percpu_wq is passed explicitly because
+-		 * INIT_DELAYED_WORK() binds no workqueue and
+-		 * mod_delayed_work() has no implicit default. It is the queue
+-		 * schedule_delayed_work() resolves to, so this keeps the work
+-		 * on the queue the rest of the driver already uses.
+-		 */
+-		if (chip->constant_replay_ms > 0)
+-			mod_delayed_work(system_percpu_wq, &chip->stop_work,
+-					msecs_to_jiffies(chip->constant_replay_ms));
+-
++	if (request == 0)
+ 		return 0;
+-	}
+ 
+-	if (!val && chip->chip_is_playing)
+-		return haptics_enable_play(chip, false);
++	atomic_set(&chip->ff_request, request);
++	schedule_work(&chip->ff_work);
+ 
+ 	return 0;
+ }
+@@ -2936,6 +2966,13 @@ static int haptics_erase(struct input_dev *dev, int effect_id)
+ 	int rc;
+ 
+ 	dev_dbg(chip->dev, "erase effect, really stop play\n");
++	/*
++	 * haptics_ff_work() takes play.lock, so cancel it before acquiring
++	 * the lock: cancel_work_sync() would otherwise wait for a work item
++	 * that is blocked on the mutex this thread holds.
++	 */
++	cancel_work_sync(&chip->ff_work);
++	atomic_set(&chip->ff_request, 0);
+ 	mutex_lock(&play->lock);
+ 	cancel_delayed_work_sync(&chip->stop_work);
+ 	if ((play->pattern_src == FIFO) &&
+@@ -6088,6 +6125,8 @@ static int haptics_probe(struct platform_device *pdev)
+ 	chip->fifo_empty_irq_en = false;
+ 	hrtimer_setup(&chip->hbst_off_timer, haptics_disable_hbst_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 	INIT_DELAYED_WORK(&chip->stop_work, haptics_stop_constant_effect_play);
++	INIT_WORK(&chip->ff_work, haptics_ff_work);
++	atomic_set(&chip->ff_request, 0);
+ 	INIT_WORK(&chip->set_gain_work, haptics_set_gain_work);
+ 
+ 	atomic_set(&chip->play.fifo_status.is_busy, 0);
+@@ -6170,6 +6209,7 @@ static void haptics_remove(struct platform_device *pdev)
+ #ifdef CONFIG_DEBUG_FS
+ 	debugfs_remove_recursive(chip->debugfs_dir);
+ #endif
++	cancel_work_sync(&chip->ff_work);
+ 	input_unregister_device(chip->input_dev);
+ 	dev_set_drvdata(chip->dev, NULL);
+ 
