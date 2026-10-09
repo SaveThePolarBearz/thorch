@@ -1,0 +1,67 @@
+From: Luke Johnson <jaewun@me.com>
+Date: Mon, 6 Oct 2026 00:00:00 +1200
+Subject: [PATCH] drm/msm: dump the display snapshot to the console
+
+The display snapshot is the driver's own record of the DPU and DSI
+hardware state at the moment something went wrong, and it is captured
+from two places:
+
+	dpu_encoder.c:  first dpu_encoder_frame_done_timeout() of the boot
+	msm_kms.c:      first msm_kms_fault_handler() invocation
+
+But MSM_DISP_SNAPSHOT_DUMP_IN_CONSOLE is 0, so _msm_disp_snapshot_work()
+never prints anything.  The capture is handed to dev_coredumpm() and
+nothing else, which means on a normal system the snapshot exists for a
+few seconds and is then consumed and removed by systemd-coredump.  On
+the AYN Thor a devcoredump entry (devcd3, failing_device
+ae00000.display-subsystem/ae01000.display-controller) was observed and
+was gone before it could be read.
+
+That makes the one diagnostic that fires at the exact instant of a stall
+unusable, which in practice has left the display fault undiagnosable:
+the only way to get the registers is to read
+/sys/kernel/debug/dri/0/kms, which has to race the fault.
+
+Print the snapshot to the kernel log as well.  This is a diagnostic-only
+change: it selects where the already-captured text is written and does
+not alter the capture path, the register reads, or any display
+behaviour.
+
+Cost is bounded.  Both triggers are once-per-boot guarded
+(frame_done_timeout_cnt == 1 and fault_snapshot_capture == 0), so at
+most a couple of dumps of a few thousand lines each per boot.  The
+snapshot is also still handed to dev_coredumpm() exactly as before.
+
+Context: chasing an intermittent top-panel corruption on the AYN Thor
+(SM8550, DSI-2 1080x1920@120Hz, enc38).  At 120Hz the frame-done
+watchdog budget is ~42ms against ~83ms at 60Hz, and the fault appears
+only at 120Hz, so the DPU state at the moment of the missed frame-done
+interrupt is the measurement that matters.  Symptom:
+
+	dpu_encoder_frame_done_timeout: enc38 frame done timeout
+	_dpu_encoder_phys_cmd_handle_ppdone_timeout: id:38 pp:2 kickoff timeout 1 cnt 1 koff_cnt 1
+	dpu_encoder_phys_cmd_prepare_for_kickoff: failed wait_for_idle: id:38 ret:-110 pp:2
+
+Note that wait_for_idle() waits on the PINGPONG tx-done interrupt, so
+-ETIMEDOUT there means the pingpong never completed the transfer.  This
+patch does not attempt to fix that; it only makes the hardware state at
+that moment observable instead of discarded.
+
+Tested by inspection only.  No AYN Thor hardware was available to the
+author, so the behavioural claim is taken from the device journal, and
+the console output itself is unverified.
+
+---
+ drivers/gpu/drm/msm/disp/msm_disp_snapshot.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+--- a/drivers/gpu/drm/msm/disp/msm_disp_snapshot.h
++++ b/drivers/gpu/drm/msm/disp/msm_disp_snapshot.h
+@@ -29,7 +29,7 @@
+ #define MSM_DISP_SNAPSHOT_MAX_BLKS		10
+
+ /* debug option to print the registers in logs */
+-#define MSM_DISP_SNAPSHOT_DUMP_IN_CONSOLE 0
++#define MSM_DISP_SNAPSHOT_DUMP_IN_CONSOLE 1
+
+ /* print debug ranges in groups of 4 u32s */
+ #define REG_DUMP_ALIGN		16

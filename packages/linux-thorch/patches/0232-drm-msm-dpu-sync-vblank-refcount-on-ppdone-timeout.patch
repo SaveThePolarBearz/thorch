@@ -1,0 +1,92 @@
+From: Luke Johnson <jaewun@me.com>
+Date: Mon, 5 Oct 2026 00:00:00 +1200
+Subject: [PATCH] drm/msm/dpu: keep vblank_refcount in sync on ppdone timeout
+
+When a command-mode encoder misses the PP TX-DONE interrupt,
+_dpu_encoder_phys_cmd_handle_ppdone_timeout() unregisters the
+RDPTR/TE callback so a dead link cannot keep interrupting:
+
+	msm_disp_snapshot_state(drm_enc->dev);
+	dpu_core_irq_unregister_callback(phys_enc->dpu_kms,
+			phys_enc->irq[INTR_IDX_RDPTR]);
+
+That unregister bypasses the refcount that
+dpu_encoder_phys_cmd_control_vblank_irq() owns, and the refcount is
+what decides whether a later registration happens at all -- it only
+calls dpu_core_irq_register_callback() on a 0 -> 1 transition:
+
+	if (enable) {
+		if (phys_enc->vblank_refcount == 0)
+			ret = dpu_core_irq_register_callback(...);
+
+So after the first ppdone timeout the encoder is left claiming a
+vblank reference it no longer holds.  The next disable decrements the
+stale count instead of reaching zero naturally, which means the
+following enable sees 1 -> 2 and skips registration again.  The
+RDPTR/TE interrupt stays off, and in the meantime wait_for_vblank()
+can only time out.
+
+dpu_encoder_helper_hw_reset() does not undo it either: it resets the
+CTL block and clears enable_state, but never re-arms the vblank
+callback.  Upstream's refcount fix (drm/msm/dpu: Modify vblank_refcount
+if error in callback) only covers a failing register/unregister, not
+this force-unregister, so the desync is still reachable.
+
+Take vblank_ctl_lock and drive the count to zero in the same place the
+callback is dropped, so the enable-side path can register again.  The
+callback is dropped whether or not the unregister itself reports an
+error, so the count follows unconditionally.
+
+Observed on AYN Thor (SM8550, DSI-2 1080x1920@120Hz, enc38) as an
+intermittent top-panel stall across the idle -> active edge of the
+link: "dpu_encoder_frame_done_timeout" / "kickoff timeout ... cnt 1" /
+"failed wait_for_idle ret:-110".  This patch does not attempt to fix
+the stall itself, only the interrupt accounting that leaves the
+encoder degraded after it.
+
+Tested by inspection and by 'git apply --check' against the synced
+ROCKNIX SM8550 tree.  No AYN Thor hardware was available to exercise
+the stall, so the behavioural claim above comes from the device
+journal signature, not from a before/after run.
+
+---
+ drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c | 22 +++++++++++++++++++++--
+ 1 file changed, 20 insertions(+), 2 deletions(-)
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_cmd.c
+@@ -163,6 +163,25 @@
+ 	phys_enc->irq[INTR_IDX_UNDERRUN] = phys_enc->hw_intf->cap->intr_underrun;
+ }
+ 
++static void _dpu_encoder_phys_cmd_drop_te_irq(
++		struct dpu_encoder_phys *phys_enc)
++{
++	mutex_lock(&phys_enc->vblank_ctl_lock);
++	if (phys_enc->vblank_refcount > 0) {
++		dpu_core_irq_unregister_callback(phys_enc->dpu_kms,
++				phys_enc->irq[INTR_IDX_RDPTR]);
++		/*
++		 * The callback is gone whether or not the unregister above
++		 * reported an error, so the count has to follow it down.
++		 * Leaving it set makes the next enable-side
++		 * control_vblank_irq(true) skip registration, since it only
++		 * registers on a 0 -> 1 transition.
++		 */
++		phys_enc->vblank_refcount = 0;
++	}
++	mutex_unlock(&phys_enc->vblank_ctl_lock);
++}
++
+ static int _dpu_encoder_phys_cmd_handle_ppdone_timeout(
+ 		struct dpu_encoder_phys *phys_enc)
+ {
+@@ -200,8 +219,7 @@
+ 			  cmd_enc->pp_timeout_report_cnt,
+ 			  atomic_read(&phys_enc->pending_kickoff_cnt));
+ 		msm_disp_snapshot_state(drm_enc->dev);
+-		dpu_core_irq_unregister_callback(phys_enc->dpu_kms,
+-				phys_enc->irq[INTR_IDX_RDPTR]);
++		_dpu_encoder_phys_cmd_drop_te_irq(phys_enc);
+ 	}
+ 
+ 	atomic_add_unless(&phys_enc->pending_kickoff_cnt, -1, 0);
