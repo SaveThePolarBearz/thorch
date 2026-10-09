@@ -131,8 +131,10 @@ Steam exits. The packaged FEX thunk database also covers pressure-vessel's
 library override aliases so containerized games can use the DRM, Vulkan, GL,
 asound, and Wayland host-library forwarding paths. The FEX Arch rootfs remains
 an x86_64 guest rootfs; when the ROCKNIX FEX-side
-`libvulkan_freedreno.so` is available, the installer copies that x86_64 guest
-driver into the rootfs just like ROCKNIX. It still refuses to copy the aarch64
+`libvulkan_freedreno.so` is available, `thorch-fex-bin` ships it as
+`/usr/share/fex-emu/libvulkan_freedreno.so` (never at `/usr/lib/`, which is the
+aarch64 host driver owned by `thorch-mesa`) and the installer copies that
+x86_64 guest driver into the rootfs just like ROCKNIX. It still refuses to copy the aarch64
 host driver over the guest library. Vulkan acceleration is provided by FEX's
 Vulkan thunk, which forwards guest Vulkan calls to the `thorch-mesa` Turnip host
 driver.

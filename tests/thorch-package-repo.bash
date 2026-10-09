@@ -220,4 +220,16 @@ fi
 grep -q 'usr/bin/alpha: alpha, beta' "${fixture}/failure" || \
   fail "collision error did not identify both owners"
 
+# Regression: thorch-fex-bin once shipped the x86_64 guest driver at the same
+# path thorch-mesa installs the host driver (c84d25a). The validator must
+# reject exactly that pair of owners.
+rm -f "${fixture}/beta-1-1-any.pkg.tar.xz"
+make_package thorch-mesa usr/lib/libvulkan_freedreno.so
+make_package thorch-fex-bin usr/lib/libvulkan_freedreno.so
+if python3 "${checker}" "${fixture}" >/dev/null 2>"${fixture}/failure"; then
+  fail "repository validator accepted the fex-bin/mesa libvulkan_freedreno.so collision"
+fi
+grep -q 'usr/lib/libvulkan_freedreno.so: thorch-fex-bin, thorch-mesa' "${fixture}/failure" ||
+  fail "fex-bin/mesa collision error did not identify both owners"
+
 printf 'thorch package repository checks passed\n'

@@ -122,12 +122,15 @@ copy_path usr/share/fex-emu/ThunksDB.json
 copy_path usr/config/fex-emu
 
 # ROCKNIX moved the FEX guest Vulkan driver from usr/share/fex-emu/ to
-# usr/lib/ (2026-09 nightlies). Normalize to usr/lib/ for both layouts.
+# usr/lib/ (2026-09 nightlies). Normalize both layouts to usr/share/fex-emu/
+# in the imported tree. It must never land at usr/lib/libvulkan_freedreno.so:
+# that is the aarch64 host driver path owned by thorch-mesa, and shipping the
+# x86_64 guest driver there collides with it.
+install -d "${dest_abs}/usr/share/fex-emu"
 if [[ -e "${runtime_root}/usr/lib/libvulkan_freedreno.so" ]]; then
-  copy_path usr/lib/libvulkan_freedreno.so
+  rsync -aL "${runtime_root}/usr/lib/libvulkan_freedreno.so" "${dest_abs}/usr/share/fex-emu/"
 elif [[ -e "${runtime_root}/usr/share/fex-emu/libvulkan_freedreno.so" ]]; then
-  install -d "${dest_abs}/usr/lib"
-  rsync -a "${runtime_root}/usr/share/fex-emu/libvulkan_freedreno.so" "${dest_abs}/usr/lib/"
+  rsync -aL "${runtime_root}/usr/share/fex-emu/libvulkan_freedreno.so" "${dest_abs}/usr/share/fex-emu/"
 fi
 
 for fmt_lib in "${runtime_root}"/usr/lib/libfmt.so.11*; do
@@ -140,7 +143,8 @@ done
 [[ -x "${dest_abs}/usr/bin/FEXRootFSFetcher" ]] || die "ROCKNIX runtime import did not produce usr/bin/FEXRootFSFetcher"
 [[ -d "${dest_abs}/usr/lib/fex-emu/HostThunks" ]] || die "ROCKNIX runtime import did not produce HostThunks"
 [[ -d "${dest_abs}/usr/share/fex-emu/GuestThunks" ]] || die "ROCKNIX runtime import did not produce GuestThunks"
-[[ -f "${dest_abs}/usr/lib/libvulkan_freedreno.so" ]] || die "ROCKNIX runtime import did not produce the FEX guest Vulkan driver"
+[[ -f "${dest_abs}/usr/share/fex-emu/libvulkan_freedreno.so" ]] || die "ROCKNIX runtime import did not produce the FEX guest Vulkan driver"
+[[ ! -e "${dest_abs}/usr/lib/libvulkan_freedreno.so" ]] || die "ROCKNIX runtime import must not stage a guest driver at the host driver path usr/lib/libvulkan_freedreno.so"
 
 fex_vulkan_source="${runtime_root}/usr/lib/libvulkan_freedreno.so"
 [[ -e "${fex_vulkan_source}" ]] || fex_vulkan_source="${runtime_root}/usr/share/fex-emu/libvulkan_freedreno.so"
