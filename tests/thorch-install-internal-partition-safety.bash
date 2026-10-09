@@ -319,6 +319,103 @@ test_shrink_confirmation_precedes_userdata_wipe() {
   [[ ! -s "${log}" ]] || fail "shrink path mutated userdata before final confirmation: $(cat "${log}")"
 }
 
+test_shrink_removes_stale_post_userdata_before_wipe() {
+  local log="${tmp}/shrink-stale-order.log"
+  set +e
+  (
+    load_installer_functions
+
+    findmnt() { return 1; }
+    readlink() {
+      if [[ "$1" == "-f" ]]; then
+        printf '%s\n' "$2"
+        return 0
+      fi
+      command readlink "$@"
+    }
+    blockdev() { printf '68719476736\n'; }
+    lsblk() {
+      case "$*" in
+        "-no START /dev/nvme0n1p1") printf '2048\n' ;;
+        "-no START /dev/nvme0n1p2") printf '132120576\n' ;;
+        "-nrpo NAME,TYPE /dev/nvme0n1") printf '/dev/nvme0n1p1 part\n/dev/nvme0n1p2 part\n' ;;
+        *) return 1 ;;
+      esac
+    }
+    parted() {
+      if [[ "$*" == "-m -s /dev/nvme0n1 unit B print" ]]; then
+        printf 'BYT;\n/dev/nvme0n1:68719476736B:gpt:512:512:gpt:mock:;\n1:1048576B:67645734911B:67644686336B:ext4:userdata:;\n2:67645734912B:68718428159B:102693248B:ext4:STORAGE:;\n'
+        return 0
+      fi
+      case "$*" in
+        *" rm "*|*" mkpart "*) printf '%s\n' "$*" >> "${log}" ;;
+      esac
+      return 0
+    }
+
+    printf 'SHRINK USERDATA\n8\nCREATE THORCH\n' | create_target_by_shrinking_userdata /dev/nvme0n1
+  ) >/dev/null 2>&1
+  local rc=$?
+  set -e
+  [[ -s "${log}" ]] || fail "shrink path did not reach the partition mutations (rc=${rc})"
+  local first second
+  first="$(sed -n '1p' "${log}")"
+  second="$(sed -n '2p' "${log}")"
+  [[ "${first}" == "-s /dev/nvme0n1 rm 2" ]] ||
+    fail "shrink path did not delete the stale post-userdata partition first: ${first}"
+  [[ "${second}" == "-s /dev/nvme0n1 rm 1" ]] ||
+    fail "shrink path did not delete userdata after the stale partition: ${second}"
+}
+
+test_shrink_aborts_before_wipe_when_stale_partition_is_mounted() {
+  local log="${tmp}/shrink-stale-mounted.log"
+  set +e
+  (
+    load_installer_functions
+
+    findmnt() {
+      if [[ "$*" == "-rn -S /dev/nvme0n1p2" ]]; then
+        return 0
+      fi
+      return 1
+    }
+    readlink() {
+      if [[ "$1" == "-f" ]]; then
+        printf '%s\n' "$2"
+        return 0
+      fi
+      command readlink "$@"
+    }
+    blockdev() { printf '68719476736\n'; }
+    lsblk() {
+      case "$*" in
+        "-no START /dev/nvme0n1p1") printf '2048\n' ;;
+        "-no START /dev/nvme0n1p2") printf '132120576\n' ;;
+        "-nrpo NAME,TYPE /dev/nvme0n1") printf '/dev/nvme0n1p1 part\n/dev/nvme0n1p2 part\n' ;;
+        *) return 1 ;;
+      esac
+    }
+    parted() {
+      if [[ "$*" == "-m -s /dev/nvme0n1 unit B print" ]]; then
+        printf 'BYT;\n/dev/nvme0n1:68719476736B:gpt:512:512:gpt:mock:;\n1:1048576B:67645734911B:67644686336B:ext4:userdata:;\n2:67645734912B:68718428159B:102693248B:ext4:STORAGE:;\n'
+        return 0
+      fi
+      case "$*" in
+        *" rm "*|*" mkpart "*) printf '%s\n' "$*" >> "${log}" ;;
+      esac
+      return 0
+    }
+
+    printf 'SHRINK USERDATA\n8\nCREATE THORCH\n' | create_target_by_shrinking_userdata /dev/nvme0n1
+  ) >/dev/null 2>&1
+  local rc=$?
+  set -e
+  [[ ${rc} -ne 0 ]] || fail "shrink path continued with a mounted stale partition"
+  if [[ -e "${log}" ]] && grep -q 'rm 1' "${log}"; then
+    fail "shrink path wiped userdata despite an unmountable stale partition: $(cat "${log}")"
+  fi
+}
+
 test_cache_tmpfs_fstab_filter() (
   load_installer_functions
 
@@ -373,6 +470,8 @@ test_untrusted_android_system_is_rejected
 test_unaligned_userdata_end_uses_next_free_mib
 test_reuse_confirmation_precedes_deletion
 test_shrink_confirmation_precedes_userdata_wipe
+test_shrink_removes_stale_post_userdata_before_wipe
+test_shrink_aborts_before_wipe_when_stale_partition_is_mounted
 test_cache_tmpfs_fstab_filter
 test_cache_tmpfs_mountpoint_restore
 

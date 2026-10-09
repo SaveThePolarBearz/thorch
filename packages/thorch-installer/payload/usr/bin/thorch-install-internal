@@ -488,6 +488,12 @@ Thorch will repartition ${disk}:
 EOF
   confirm_or_fail "CREATE THORCH" "Type CREATE THORCH to continue: "
 
+  # Anything after the old userdata end sits in the area Thorch is about to
+  # claim. Remove it BEFORE deleting userdata: if a stale partition cannot be
+  # removed (still mounted), that must abort while Android userdata is still
+  # intact, not after the wipe. The reuse path takes the same precaution.
+  delete_partitions_after_userdata "${disk}" "${ud_end_bytes}"
+
   echo ":: thorch-install phase=resize-userdata"
   parted -s "${disk}" rm "${ud_num}"
   before_nums="$(partition_numbers "${disk}")"
