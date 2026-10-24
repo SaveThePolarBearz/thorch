@@ -1,0 +1,77 @@
+From: Luke Johnson <jaewun@me.com>
+Date: Mon, 5 Oct 2026 00:00:00 +1200
+Subject: [PATCH] drm/panel: panel-chipone-icna35xx: do not fail disable on DCS error
+
+icna35xx_disable() hands dsi_ctx.accum_err straight back to the DRM
+core.  A failed DCS transfer therefore turns into a failed ->disable,
+and drm_panel_disable() only clears drm_panel::enabled on success:
+
+	if (panel->funcs && panel->funcs->disable) {
+		ret = panel->funcs->disable(panel);
+		if (ret < 0)
+			goto exit;
+	}
+	panel->enabled = false;
+
+The next drm_panel_enable() then short-circuits:
+
+	if (panel->enabled) {
+		dev_warn(panel->dev, "Skipping enable of already enabled panel\n");
+		return;
+	}
+
+This panel has no ->enable callback, so the flag being wrong costs
+exactly one thing: the backlight_enable() below that early return is
+never reached.  A display that otherwise came back cleanly stays black,
+and because drm_panel_disable() stops at the same goto exit, every
+subsequent recovery attempt starts from the same wrong state.
+
+Observed on AYN Thor while recovering a stalled DSI-2 link: the
+garbled-panel recovery sends DCS SET_DISPLAY_OFF, that transfer times
+out (-110; dsi_cmd_dma_tx() waits 200 ms for CMD_MDP_DONE at
+dsi_host.c:1458), and the very next enable logs "Skipping enable of
+already enabled panel" -- so each failed recovery leaves the next one
+starting from a worse place.
+
+Log the error and report success.  The panel is powered down in
+icna35xx_unprepare() regardless of what the DCS said, and there is no
+action a caller could take on this error anyway: the only recovery is
+a full re-prepare, which is what the next enable or modeset does.
+
+Kept local to this driver rather than teaching the generic
+drm_panel_disable() to clear ->enabled on a partially failed disable,
+since other panels can fail for reasons where the flag does matter.
+
+Tested by inspection and by 'git apply --check' against the synced
+ROCKNIX SM8550 tree.  No AYN Thor hardware was available, so the
+behavioural claim comes from the device journal, not a before/after
+run.
+
+---
+ drivers/gpu/drm/panel/panel-chipone-icna35xx.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+--- a/drivers/gpu/drm/panel/panel-chipone-icna35xx.c
++++ b/drivers/gpu/drm/panel/panel-chipone-icna35xx.c
+@@ -346,7 +346,21 @@
+ 	mipi_dsi_dcs_enter_sleep_mode_multi(&dsi_ctx);
+ 	mipi_dsi_msleep(&dsi_ctx, 120);
+ 
+-	return dsi_ctx.accum_err;
++	/*
++	 * Do not propagate a failed DCS transfer.  drm_panel_disable()
++	 * only clears drm_panel::enabled when ->disable succeeds, so
++	 * returning accum_err here leaves the core believing the panel is
++	 * still on.  The next drm_panel_enable() then early-returns with
++	 * "Skipping enable of already enabled panel" and never reaches
++	 * backlight_enable(), so a display that did come back stays black.
++	 * There is no ->enable here for it to skip, so that flag is the
++	 * only thing the failure costs us, and unprepare() powers the
++	 * panel down regardless of what the DCS said.
++	 */
++	if (dsi_ctx.accum_err)
++		dev_warn(panel->dev, "DCS disable failed: %d\n", dsi_ctx.accum_err);
++
++	return 0;
+ }
+ 
+ static int icna35xx_unprepare(struct drm_panel *panel)
