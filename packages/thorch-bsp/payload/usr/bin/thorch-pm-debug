@@ -36,6 +36,29 @@ have_pm_debug_knob() { [[ -e "${pm_debug_messages}" ]]; }
 # Return 0 if the dynamic_debug control interface is reachable.
 have_dyndbg() { [[ -w "${dyndbg_control}" ]]; }
 
+# Debugfs is not mounted by default. Mount it for the runtime dyndbg and
+# pstore/ftrace interfaces, but only for the real root, never a test root.
+ensure_debugfs() {
+  [[ -w "${dyndbg_control}" ]] && return 0
+  [[ "${debugfs_root}" == "/sys/kernel/debug" ]] || return 0
+  [[ -d "${debugfs_root}" ]] || return 0
+  command -v mount >/dev/null 2>&1 || return 0
+  if mount -t debugfs none "${debugfs_root}" 2>/dev/null; then
+    log "mounted debugfs at ${debugfs_root}"
+  fi
+  return 0
+}
+
+# The kernel-side PMDIAG instrumentation (UFS/ICE/SCM resume, hardlockup and
+# tick snapshots) is written as dev_dbg()/pr_warn() lines carrying a PMDIAG
+# tag, so one format match enables all of it.
+dyndbg_commands() {
+  local action="$1"
+
+  printf 'file %s %s; format "PMDIAG" %s' \
+    "${dyndbg_file}" "${action}" "${action}"
+}
+
 arm() {
   if ! have_pm_debug_knob; then
     # Feature absent (kernel built without CONFIG_PM_DEBUG): a graceful no-op
@@ -50,14 +73,15 @@ arm() {
     return 1
   fi
 
+  ensure_debugfs
   if have_dyndbg; then
-    if printf 'file %s +p' "${dyndbg_file}" >"${dyndbg_control}" 2>/dev/null; then
-      log "enabled pm_dev_dbg dyndbg sites (file ${dyndbg_file} +p)"
+    if dyndbg_commands +p >"${dyndbg_control}" 2>/dev/null; then
+      log "enabled pm_dev_dbg and PMDIAG dyndbg sites"
     else
       log "failed to enable dyndbg sites (non-fatal)"
     fi
   else
-    log "dynamic_debug/control not writable; pm_dev_dbg dev_dbg() sites left off"
+    log "dynamic_debug/control not writable; pm_dev_dbg and PMDIAG sites left off"
   fi
   return 0
 }
@@ -73,7 +97,7 @@ disarm() {
     fi
   fi
   if have_dyndbg; then
-    printf 'file %s -p' "${dyndbg_file}" >"${dyndbg_control}" 2>/dev/null ||
+    dyndbg_commands -p >"${dyndbg_control}" 2>/dev/null ||
       log "failed to disable dyndbg sites (non-fatal)"
   fi
   return "${rc}"
@@ -95,6 +119,12 @@ status() {
       printf 'dyndbg %s=+p\n' "${dyndbg_file}"
     else
       printf 'dyndbg %s=-p\n' "${dyndbg_file}"
+    fi
+    if grep -F -- 'PMDIAG' "${dyndbg_control}" 2>/dev/null |
+        grep -Eq ' =[^ ]*p'; then
+      printf 'dyndbg PMDIAG=+p\n'
+    else
+      printf 'dyndbg PMDIAG=-p\n'
     fi
   else
     printf 'dyndbg=unavailable\n'

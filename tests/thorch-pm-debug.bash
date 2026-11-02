@@ -51,7 +51,8 @@ expect_eq "apply with THORCH_PM_DEBUG=0 leaves knob at 0" "$(cat "${pm_file}")" 
 PM_SETTING=1 run apply >/dev/null
 expect_eq "apply with THORCH_PM_DEBUG=1 sets knob to 1" "$(cat "${pm_file}")" "1"
 # The fake is a plain file, so this only proves the command that was issued.
-expect_eq "apply issues the dyndbg +p command" "$(cat "${dyn_file}")" "file drivers/base/power/main.c +p"
+expect_eq "apply issues the dyndbg +p commands" "$(cat "${dyn_file}")" \
+  'file drivers/base/power/main.c +p; format "PMDIAG" +p'
 
 # 3. status reflects armed state. A real dynamic_debug/control file is a
 # catalog, not an echo of the last command, so seed it in the kernel's format
@@ -74,16 +75,29 @@ expect_eq "status reports dyndbg +p when catalog site is enabled" \
 cat >"${dyn_file}" <<'EOF'
 # filename:lineno [module]function flags format
 drivers/base/power/main.c:210 [main]pm_dev_dbg =_ "calling %s\n"
-drivers/base/power/runtime.c:99 [runtime]rpm_idle =p "unrelated file enabled\n"
+drivers/soc/qcom/ice.c:390 [ice]qcom_ice_resume =_ "PMDIAG ice resume end ret=%d\n"
+drivers/base/power/runtime.c:99 [runtime]rpm_idle =_ "unrelated\n"
 EOF
 out="$(PM_SETTING=1 run status)"
 expect_eq "status reports dyndbg -p when only other files are enabled" \
   "$(grep -c '^dyndbg drivers/base/power/main.c=-p$' <<<"${out}")" "1"
+expect_eq "status reports PMDIAG -p when the PMDIAG sites are disabled" \
+  "$(grep -c '^dyndbg PMDIAG=-p$' <<<"${out}")" "1"
+
+cat >"${dyn_file}" <<'EOF'
+# filename:lineno [module]function flags format
+drivers/base/power/main.c:210 [main]pm_dev_dbg =_ "calling %s\n"
+drivers/soc/qcom/ice.c:390 [ice]qcom_ice_resume =p "PMDIAG ice resume end ret=%d\n"
+EOF
+out="$(PM_SETTING=1 run status)"
+expect_eq "status reports PMDIAG +p when a PMDIAG site is enabled" \
+  "$(grep -c '^dyndbg PMDIAG=+p$' <<<"${out}")" "1"
 
 # 4. disarm turns the knob back off and removes dyndbg +p.
 PM_SETTING=1 run disarm >/dev/null
 expect_eq "disarm sets knob to 0" "$(cat "${pm_file}")" "0"
-expect_eq "disarm issues the dyndbg -p command" "$(cat "${dyn_file}")" "file drivers/base/power/main.c -p"
+expect_eq "disarm issues the dyndbg -p commands" "$(cat "${dyn_file}")" \
+  'file drivers/base/power/main.c -p; format "PMDIAG" -p'
 
 # 5. Missing knob (kernel without CONFIG_PM_DEBUG): apply must not fail hard.
 rm -f "${pm_file}"

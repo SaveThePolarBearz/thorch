@@ -1,0 +1,65 @@
+From: Thorch contributors
+Subject: [PATCH] pstore/ram: support size-allocated reserved memory
+
+The Thor device tree reserves ramoops with "size", "alignment" and
+"alloc-ranges" and no "reg" property, so early memblock allocation picks
+the address. ramoops_parse_dt() only accepts a platform resource and
+fails with "failed to locate DT /reserved-memory resource", leaving
+pstore and the persistent ftrace backend unbound: nothing from a wedged
+boot (last kmsg, an oops, a hardlockup report) is retained across the
+hard reset that follows.
+
+Fall back to the region chosen for the reserved-memory node when the
+device has no IORESOURCE_MEM resource. The node's no-map property (set in
+the DTS alongside this change) is what makes the kernel actually reserve
+the region at early init and expose it here.
+
+Ported from linux-thorch 346d69ca ("fix: resolve dynamically reserved
+ramoops memory"). Tested by inspection only; the vendor kernel tree is
+not part of this repository.
+---
+ fs/pstore/ram.c | 25 ++++++++++++++++++-------
+  1 file changed, 18 insertions(+), 7 deletions(-)
+---
+--- a/fs/pstore/ram.c
++++ b/fs/pstore/ram.c
+@@ -20,6 +20,7 @@
+ #include <linux/compiler.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
++#include <linux/of_reserved_mem.h>
+ #include <linux/mm.h>
+ 
+ #include "internal.h"
+@@ -655,14 +656,24 @@ static int ramoops_parse_dt(struct platform_device *pdev,
+ 	dev_dbg(&pdev->dev, "using Device Tree\n");
+ 
+ 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+-	if (!res) {
+-		dev_err(&pdev->dev,
+-			"failed to locate DT /reserved-memory resource\n");
+-		return -EINVAL;
+-	}
++	if (res) {
++		pdata->mem_size = resource_size(res);
++		pdata->mem_address = res->start;
++	} else {
++		/* A size-based reserved-memory node has no reg property. Use
++		 * the region selected by early memblock allocation instead.
++		 */
++		struct reserved_mem *rmem = of_reserved_mem_lookup(pdev->dev.of_node);
+ 
+-	pdata->mem_size = resource_size(res);
+-	pdata->mem_address = res->start;
++		if (rmem && rmem->size) {
++			pdata->mem_size = rmem->size;
++			pdata->mem_address = rmem->base;
++		} else {
++			dev_err(&pdev->dev,
++				"failed to locate DT /reserved-memory resource\n");
++			return -EINVAL;
++		}
++	}
+ 	/*
+ 	 * Setting "unbuffered" is deprecated and will be ignored if
+ 	 * "mem_type" is also specified.

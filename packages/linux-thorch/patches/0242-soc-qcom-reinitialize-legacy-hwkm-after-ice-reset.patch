@@ -1,0 +1,151 @@
+From: Thorch contributors
+Subject: [PATCH] soc: qcom: reinitialize legacy HWKM after an ICE hardware reset
+
+qcom_ice_program_wrapped_key() trusts ice->hwkm_init_complete across a
+UFS controller reset. A reset can reset the ICE block after the resume
+callback already initialized HWKM, and the software flag then suppresses
+the reinitialization the hardware now needs, so the first wrapped-key
+program after such a reset fails or programs an unusable slot. That is a
+plausible failure on the s2idle resume path, where the UFS controller
+resets and every key is reprogrammed.
+
+Check the hardware control bit on each wrapped-key program and clear the
+software flag when the hardware reports that HWKM needs setup again,
+matching the downstream per-key check instead of trusting the cached
+state. This also traces the legacy key path and the SCM wait/alloc
+stages with PMDIAG dev_dbg lines so a key-programming stall is visible
+next to the last completed step.
+
+Ported from linux-thorch 35dd0a99 ("fix: reinitialize legacy HWKM after
+ICE hardware reset"). Tested by inspection only; the vendor kernel tree
+is not part of this repository.
+---
+ drivers/firmware/qcom/qcom_scm-smc.c | 9 +++++++++
+ drivers/firmware/qcom/qcom_scm.c     | 7 +++++++
+ drivers/soc/qcom/ice.c               | 15 +++++++++++++++
+  3 files changed, 31 insertions(+)
+---
+--- a/drivers/firmware/qcom/qcom_scm-smc.c
++++ b/drivers/firmware/qcom/qcom_scm-smc.c
+@@ -99,13 +99,17 @@ static int __scm_smc_do_quirk_handle_waitq(struct device *dev, struct arm_smccc_
+ 	struct arm_smccc_args *smc = waitq;
+ 
+ 	do {
++		dev_dbg(dev, "PMDIAG scm smc begin fn=%#lx\n", smc->args[0]);
+ 		__scm_smc_do_quirk(smc, res);
++		dev_dbg(dev, "PMDIAG scm smc end status=%ld\n", (long)res->a0);
+ 
+ 		if (res->a0 == QCOM_SCM_WAITQ_SLEEP) {
+ 			wq_ctx = res->a1;
+ 			smc_call_ctx = res->a2;
+ 
++			dev_dbg(dev, "PMDIAG scm waitq begin\n");
+ 			ret = qcom_scm_wait_for_wq_completion(wq_ctx);
++			dev_dbg(dev, "PMDIAG scm waitq end ret=%d\n", ret);
+ 			if (ret)
+ 				return ret;
+ 
+@@ -128,11 +132,14 @@ static int __scm_smc_do(struct device *dev, struct arm_smccc_args *smc,
+ 	}
+ 
+ 	do {
++		dev_dbg(dev, "PMDIAG scm lock begin fn=%#lx retry=%d\n", smc->args[0], retry_count);
+ 		mutex_lock(&qcom_scm_lock);
++		dev_dbg(dev, "PMDIAG scm lock end\n");
+ 
+ 		ret = __scm_smc_do_quirk_handle_waitq(dev, smc, res);
+ 
+ 		mutex_unlock(&qcom_scm_lock);
++		dev_dbg(dev, "PMDIAG scm unlock end ret=%d\n", ret);
+ 
+ 		if (ret)
+ 			return ret;
+@@ -177,9 +184,11 @@ int __scm_smc_call(struct device *dev, const struct qcom_scm_desc *desc,
+ 		if (!mempool)
+ 			return -EINVAL;
+ 
++		dev_dbg(dev, "PMDIAG scm extended-args alloc begin\n");
+ 		args_virt = qcom_tzmem_alloc(mempool,
+ 					     SCM_SMC_N_EXT_ARGS * sizeof(u64),
+ 					     flag);
++		dev_dbg(dev, "PMDIAG scm extended-args alloc end ok=%d\n", !!args_virt);
+ 		if (!args_virt)
+ 			return -ENOMEM;
+ 
+--- a/drivers/firmware/qcom/qcom_scm.c
++++ b/drivers/firmware/qcom/qcom_scm.c
+@@ -1620,16 +1620,23 @@ int qcom_scm_legacy_ice_set_key(u32 index, const u8 *key, u32 key_size,
+ 
+ 	if (!key || !key_size || key_size > 128)
+ 		return -EINVAL;
++	dev_dbg(__scm->dev, "PMDIAG legacy-key capabilities begin\n");
+ 	if (!(qcom_scm_legacy_ice_capabilities() & QCOM_SCM_LEGACY_ICE_SET_KEY))
+ 		return -EOPNOTSUPP;
++	dev_dbg(__scm->dev, "PMDIAG legacy-key capabilities end; tzmem-alloc begin\n");
+ 	keybuf = qcom_tzmem_alloc(__scm->mempool, key_size, GFP_KERNEL);
++	dev_dbg(__scm->dev, "PMDIAG legacy-key tzmem-alloc end ok=%d\n", !!keybuf);
+ 	if (!keybuf)
+ 		return -ENOMEM;
+ 	memcpy(keybuf, key, key_size);
+ 	desc.args[1] = qcom_tzmem_to_phys(keybuf);
++	dev_dbg(__scm->dev, "PMDIAG legacy-key scm-call begin\n");
+ 	ret = qcom_scm_call(__scm->dev, &desc, NULL);
++	dev_dbg(__scm->dev, "PMDIAG legacy-key scm-call end ret=%d\n", ret);
+ 	memzero_explicit(keybuf, key_size);
++	dev_dbg(__scm->dev, "PMDIAG legacy-key tzmem-free begin\n");
+ 	qcom_tzmem_free(keybuf);
++	dev_dbg(__scm->dev, "PMDIAG legacy-key tzmem-free end\n");
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(qcom_scm_legacy_ice_set_key);
+--- a/drivers/soc/qcom/ice.c
++++ b/drivers/soc/qcom/ice.c
+@@ -451,6 +451,15 @@ static int qcom_ice_program_wrapped_key(struct qcom_ice *ice, unsigned int slot,
+ 		dev_err_ratelimited(dev, "Got wrapped key when not using HWKM\n");
+ 		return -EINVAL;
+ 	}
++	/* A UFS controller reset can reset ICE after the resume callback has
++	 * initialized HWKM. Match the downstream per-key hardware check rather
++	 * than trusting the software flag across that reset.
++	 */
++	if (ice->android_legacy_hwkm &&
++	    (qcom_ice_readl(ice, QCOM_ICE_REG_CONTROL) & BIT(0))) {
++		dev_dbg(dev, "PMDIAG wrapped-key hardware requests hwkm reinit slot=%u\n", slot);
++		ice->hwkm_init_complete = false;
++	}
+ 	if (!ice->hwkm_init_complete) {
+ 		if (ice->android_legacy_hwkm) {
+ 			err = qcom_ice_hwkm_init(ice);
+@@ -464,8 +473,10 @@ static int qcom_ice_program_wrapped_key(struct qcom_ice *ice, unsigned int slot,
+ 	}
+ 
+ 	/* Clear CFGE before programming the key. */
++	dev_dbg(dev, "PMDIAG wrapped-key cfge-clear begin slot=%u\n", slot);
+ 	qcom_ice_writel(ice, 0x0, QCOM_ICE_REG_CRYPTOCFG(slot));
+ 	wmb();
++	dev_dbg(dev, "PMDIAG wrapped-key cfge-clear end slot=%u\n", slot);
+ 
+ 	/* Call into TrustZone to program the wrapped key using HWKM. */
+ 	if (ice->android_legacy_hwkm) {
+@@ -473,8 +484,10 @@ static int qcom_ice_program_wrapped_key(struct qcom_ice *ice, unsigned int slot,
+ 			return -EINVAL;
+ 		cfg.capidx = ice->crypto_cap_idx;
+ 		/* Thor's crypto-qti-hwkm module ABI: slot*2, cipher/dusize/CE=0. */
++		dev_dbg(dev, "PMDIAG wrapped-key legacy-scm begin slot=%u\n", slot);
+ 		err = qcom_scm_legacy_ice_set_key(slot * 2, bkey->bytes,
+ 						bkey->size, 0, 0, 0);
++		dev_dbg(dev, "PMDIAG wrapped-key legacy-scm end slot=%u ret=%d\n", slot, err);
+ 	} else {
+ 		err = qcom_scm_ice_set_key(translate_hwkm_slot(ice, slot), bkey->bytes,
+ 				   bkey->size, cfg.capidx, cfg.dusize);
+@@ -487,8 +500,10 @@ static int qcom_ice_program_wrapped_key(struct qcom_ice *ice, unsigned int slot,
+ 	}
+ 
+ 	/* Set CFGE after programming the key. */
++	dev_dbg(dev, "PMDIAG wrapped-key cfge-enable begin slot=%u\n", slot);
+ 	qcom_ice_writel(ice, le32_to_cpu(cfg.regval),
+ 			QCOM_ICE_REG_CRYPTOCFG(slot));
+ 	wmb();
++	dev_dbg(dev, "PMDIAG wrapped-key cfge-enable end slot=%u\n", slot);
+ 	return 0;
+ }

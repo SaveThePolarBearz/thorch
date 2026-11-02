@@ -1,0 +1,61 @@
+From: Thorch contributors
+Subject: [PATCH] arm64: dts: qcom: qcs8550-ayn-thor: reserve ramoops memory
+
+Give the Thor a persistent crash store. The shared AYN reserved-memory
+node is unlabeled, so extend it by path instead of declaring a second
+root-level "reserved-memory" node: a duplicate node name is a dtc error
+and would fail the DTB build. The region is allocated by early memblock
+from the top of RAM rather than pinned to a guessed address, like the
+stock Thor device tree does, and is marked no-map so the kernel keeps it
+out of the linear map and the allocator.
+
+The record/console/ftrace/pmsg budgets leave room for one oops record,
+the last kmsg, a persistent function trace and one pmsg record inside a
+4 MiB window. CONFIG_PSTORE_RAM now binds against the node via the
+size-based reserved-memory fallback.
+
+Whether the bootloader preserves this RAM across a hard reset on this
+board must be validated on the device before relying on it.
+
+Ported from linux-thorch 5029454f ("feat: add Thor persistent crash
+storage and opt-in sync diagnostics") and 346d69ca ("fix: resolve
+dynamically reserved ramoops memory"). The original declared a new
+root-level reserved-memory node, which collides with the node that
+qcs8550-ayn-common.dtsi already defines; this version extends that node
+by path.
+---
+ arch/arm64/boot/dts/qcom/qcs8550-ayn-thor.dts | 21 +++++++++++++++++++++
+  1 file changed, 21 insertions(+)
+---
+diff --git a/arch/arm64/boot/dts/qcom/qcs8550-ayn-thor.dts b/arch/arm64/boot/dts/qcom/qcs8550-ayn-thor.dts
+--- a/arch/arm64/boot/dts/qcom/qcs8550-ayn-thor.dts
++++ b/arch/arm64/boot/dts/qcom/qcs8550-ayn-thor.dts
+@@ -6,7 +6,28 @@
+ /dts-v1/;
+ 
+ #include "qcs8550-ayn-common.dtsi"
+ 
++/*
++ * The shared AYN reserved-memory node has no label, so extend it by
++ * path. Like the stock Thor DT, allocate instead of guessing a DRAM
++ * address; early memblock allocation excludes firmware regions.
++ * Cross-reset retention must be validated on this bootloader.
++ */
++&{/reserved-memory} {
++	ramoops {
++		compatible = "ramoops";
++		no-map;
++		size = <0 0x400000>;
++		alignment = <0 0x400000>;
++		alloc-ranges = <0 0 0xffffffff 0xffffffff>;
++		record-size = <0x40000>;
++		console-size = <0x100000>;
++		ftrace-size = <0x100000>;
++		pmsg-size = <0x40000>;
++		mem-type = <0>;
++	};
++};
++
+ / {
+ 	model = "AYN Thor";
+ 	compatible = "ayn,thor", "qcom,qcs8550", "qcom,sm8550";

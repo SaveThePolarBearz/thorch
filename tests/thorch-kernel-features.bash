@@ -20,7 +20,13 @@ haptics_sweep_log_patch="${root}/packages/linux-thorch/patches/0230-input-qcom-h
 haptics_brake_toggle_patch="${root}/packages/linux-thorch/patches/0231-input-qcom-haptics-drop-brake-poll-force-toggle.patch"
 haptics_ff_defer_patch="${root}/packages/linux-thorch/patches/0237-input-qcom-haptics-defer-ff-hardware-to-workqueue.patch"
 haptics_stop_log_patch="${root}/packages/linux-thorch/patches/0238-input-qcom-haptics-report-rc-on-stop-constant-failure.patch"
+haptics_lra_board_patch="${root}/packages/linux-thorch/patches/0243-input-qcom-haptics-calibrate-against-board-lra-period.patch"
 edt_resume_irq_patch="${root}/packages/linux-thorch/patches/0236-input-edt-ft5x06-reenable-irq-on-resume-failure.patch"
+s2idle_lockup_patch="${root}/packages/linux-thorch/patches/0239-time-ignore-s2idle-frozen-ticks-in-hardlockup-check.patch"
+ramoops_patch="${root}/packages/linux-thorch/patches/0240-fs-pstore-ram-support-size-allocated-reserved-memory.patch"
+resume_trace_patch="${root}/packages/linux-thorch/patches/0241-ufs-trace-resume-stages-with-pmdiag.patch"
+hwkm_patch="${root}/packages/linux-thorch/patches/0242-soc-qcom-reinitialize-legacy-hwkm-after-ice-reset.patch"
+ramoops_dts_patch="${root}/packages/linux-thorch/dts-patches/0009-arm64-dts-qcom-qcs8550-ayn-thor-reserve-ramoops-memory.patch"
 haptics_driver_base_patch="${root}/vendor/rocknix-sm8550/patches/linux/1000-add-qcom-haptics-driver.patch"
 haptics_driver_sine_patch="${root}/vendor/rocknix-sm8550/patches/linux/1002-haptics-driver-support-periodic-sine-and-fixes.patch"
 # Post-vendor-patch snapshot of the haptics driver, tracked so the Thor chain
@@ -47,9 +53,25 @@ for symbol in \
   UPROBE_EVENTS \
   PERF_EVENTS \
   BPF_EVENTS \
+  SOFTLOCKUP_DETECTOR \
+  HARDLOCKUP_DETECTOR \
+  HARDLOCKUP_DETECTOR_BUDDY \
+  DETECT_HUNG_TASK \
+  PSTORE \
+  PSTORE_CONSOLE \
+  PSTORE_PMSG \
+  PSTORE_RAM \
   CPU_FREQ_DEFAULT_GOV_SCHEDUTIL; do
   grep -qx "CONFIG_${symbol}=y" "${fragment}" ||
     fail "kernel fragment does not enable CONFIG_${symbol}"
+done
+for setting in \
+  'CONFIG_LOG_BUF_SHIFT=22' \
+  'CONFIG_PSTORE_DEFAULT_KMSG_BYTES=262144' \
+  'CONFIG_DEFAULT_HUNG_TASK_TIMEOUT=0' \
+  '# CONFIG_WQ_WATCHDOG is not set'; do
+  grep -qx "${setting}" "${fragment}" ||
+    fail "kernel fragment does not set ${setting}"
 done
 grep -qx '# CONFIG_DEBUG_INFO_REDUCED is not set' "${fragment}" ||
   fail "kernel fragment leaves reduced debug info enabled"
@@ -120,6 +142,42 @@ grep -Fq 'final ROCKNIX Thor DTS does not clear the haptics ERM flag' "${build_s
 git apply --numstat -- "${edt_resume_irq_patch}" >/dev/null 2>&1 ||
   fail "Thor touchscreen resume IRQ balance patch is malformed"
 
+# Suspend-wedge instrumentation and persistent crash storage.
+for patch in "${s2idle_lockup_patch}" "${ramoops_patch}" "${resume_trace_patch}" \
+  "${hwkm_patch}" "${ramoops_dts_patch}"; do
+  [[ -f "${patch}" ]] || fail "suspend diagnostics patch is missing: ${patch}"
+  git apply --numstat -- "${patch}" >/dev/null 2>&1 ||
+    fail "suspend diagnostics patch is malformed: $(basename "${patch}")"
+done
+grep -Fq 'bool tick_cpu_suspended(unsigned int cpu)' "${s2idle_lockup_patch}" ||
+  fail "hardlockup check does not know whether a tick is suspended"
+grep -Fq 'touch_nmi_watchdog();' "${s2idle_lockup_patch}" ||
+  fail "tick_unfreeze does not reset the hardlockup baseline"
+grep -Fq 'PMDIAG hardlock observer=' "${s2idle_lockup_patch}" ||
+  fail "hardlockup report does not snapshot the tick freeze state"
+grep -Fq 'of_reserved_mem_lookup(pdev->dev.of_node)' "${ramoops_patch}" ||
+  fail "ramoops parser does not fall back to the size-based reserved region"
+grep -Fq 'no-map;' "${ramoops_dts_patch}" ||
+  fail "ramoops reserved-memory node is not no-map"
+grep -Fq 'compatible = "ramoops";' "${ramoops_dts_patch}" ||
+  fail "Thor DTS does not reserve a ramoops region"
+# qcs8550-ayn-common.dtsi already defines a root-level reserved-memory node
+# with no label, so the Thor file must extend it by path; a second node of
+# the same name is a dtc error and fails the DTB build.
+grep -Fq '&{/reserved-memory} {' "${ramoops_dts_patch}" ||
+  fail "ramoops DTS patch does not extend the shared reserved-memory node by path"
+if grep -Eq '^\+[[:space:]]*reserved-memory \{' "${ramoops_dts_patch}"; then
+  fail "ramoops DTS patch adds a duplicate root-level reserved-memory node"
+fi
+grep -Fq 'PMDIAG wl resume begin' "${resume_trace_patch}" ||
+  fail "UFS resume stages are not traced"
+grep -Fq 'PMDIAG ice resume end' "${resume_trace_patch}" ||
+  fail "ICE resume stages are not traced"
+grep -Fq 'PMDIAG wrapped-key hardware requests hwkm reinit' "${hwkm_patch}" ||
+  fail "ICE does not reinitialize HWKM after a hardware reset"
+grep -Fq 'qcom_ice_readl(ice, QCOM_ICE_REG_CONTROL) & BIT(0)' "${hwkm_patch}" ||
+  fail "HWKM reinit is not gated on the hardware control bit"
+
 # The FF stop-path fixes are verified against the real patched driver, not
 # against the patch text. Grepping a diff cannot distinguish an applied hunk
 # from its removal line or the commit message quoting the old code, and it
@@ -147,7 +205,8 @@ for patch in \
   "${haptics_sweep_log_patch}" \
   "${haptics_brake_toggle_patch}" \
   "${haptics_ff_defer_patch}" \
-  "${haptics_stop_log_patch}"; do
+  "${haptics_stop_log_patch}" \
+  "${haptics_lra_board_patch}"; do
   git -C "${haptics_scratch}" apply \
     --include="${haptics_driver_rel}" -- "${patch}" ||
     fail "haptics patch chain does not apply: ${patch}"
@@ -168,7 +227,8 @@ if [[ -f "${haptics_driver_base_patch}" && -f "${haptics_driver_sine_patch}" ]];
     "${haptics_sweep_log_patch}" \
     "${haptics_brake_toggle_patch}" \
     "${haptics_ff_defer_patch}" \
-    "${haptics_stop_log_patch}"; do
+    "${haptics_stop_log_patch}" \
+    "${haptics_lra_board_patch}"; do
     git -C "${haptics_vendor_scratch}" apply \
       --include="${haptics_driver_rel}" -- "${patch}" ||
       fail "haptics patch chain does not apply against vendor: ${patch}"
@@ -306,14 +366,36 @@ fi
 if grep -Fq 'while ((cl_f_lra < LRA_SPEC_MIN_FREQUENCY' "${haptics_src}"; then
   fail "patched haptics driver still retries the LRA boot calibration"
 fi
-# Dropping the retries must not change the frequency the motor runs at.
-grep -Fq '"lra frequency detected at boot: %d Hz\n", cl_f_lra);' "${haptics_src}" ||
+# Dropping the retries must not change the frequency the motor runs at: the
+# window now comes from the board period, and the fallback uses that period
+# too instead of the fixed 205 Hz default. See 0243.
+haptics_hw_init_body="$(awk '/^static int haptics_hw_init\(/,/^}/' "${haptics_src}")"
+[[ -n "${haptics_hw_init_body}" ]] ||
+  fail "patched haptics driver has no haptics_hw_init() to inspect"
+if grep -Fq 'LRA_SPEC_' "${haptics_src}"; then
+  fail "patched haptics driver still validates against the fixed LRA spec window"
+fi
+printf '%s\n' "${haptics_hw_init_body}" |
+  grep -Fq '"lra frequency detected at boot: %d Hz\n", cl_f_lra);' ||
   fail "patched haptics driver no longer logs the SDAM boot LRA frequency"
-grep -Fq 'haptics_config_openloop_lra_period(chip, LRA_SPEC_DEFAULT_PERIOD_US);' \
-  "${haptics_src}" ||
-  fail "patched haptics driver no longer forces the default LRA frequency"
-grep -Fq 'chip->config.cl_t_lra_us = LRA_SPEC_DEFAULT_PERIOD_US;' "${haptics_src}" ||
-  fail "patched haptics driver no longer stores the default LRA period"
+printf '%s\n' "${haptics_hw_init_body}" |
+  grep -Fq 'if (!chip->config.t_lra_us || !chip->config.cl_t_lra_us)' ||
+  fail "patched haptics driver divides by the LRA period without checking it"
+printf '%s\n' "${haptics_hw_init_body}" |
+  grep -Fq 'nominal_f_lra = DIV_ROUND_CLOSEST(USEC_PER_SEC, chip->config.t_lra_us);' ||
+  fail "patched haptics driver does not derive the LRA window from the board period"
+printf '%s\n' "${haptics_hw_init_body}" |
+  grep -Fq 'min_f_lra = nominal_f_lra * 90 / 100;' ||
+  fail "patched haptics driver does not window the calibration around the board period"
+printf '%s\n' "${haptics_hw_init_body}" |
+  grep -Fq 'rc = haptics_start_lra_calibrate(chip);' ||
+  fail "patched haptics driver drops the boot calibration retries entirely"
+printf '%s\n' "${haptics_hw_init_body}" |
+  grep -Fq 'haptics_config_openloop_lra_period(chip, chip->config.t_lra_us);' ||
+  fail "patched haptics driver does not fall back to the board LRA period"
+printf '%s\n' "${haptics_hw_init_body}" |
+  grep -Fq 'chip->config.cl_t_lra_us = chip->config.t_lra_us;' ||
+  fail "patched haptics driver does not store the board LRA period on fallback"
 # The sysfs calibration path still drives the actuator on demand.
 grep -Fq 'rc = haptics_start_lra_calibrate(chip);' "${haptics_src}" ||
   fail "patched haptics driver dropped the sysfs LRA calibration entry point"

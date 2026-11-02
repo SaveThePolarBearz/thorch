@@ -1,0 +1,163 @@
+From: Thorch contributors
+Subject: [PATCH] time: ignore s2idle-frozen ticks in the hardlockup check
+
+The buddy hardlockup detector samples every CPU's local hrtimer tick
+counter and treats an unchanged value as missed watchdog interrupts.
+s2idle deliberately freezes the tick on every CPU but one, so a running
+buddy can interpret that freeze as a hard lockup. On this device that
+shows up as a hardlockup report during suspend entry or resume, and with
+any hardlockup panic enabled it turns an overnight s2idle attempt into a
+dead device that needs a hard reset.
+
+Track the freeze state per CPU alongside the existing tick-freeze
+diagnostics, have the checker reset its baseline and skip CPUs that are
+suspended (both before and after sampling their counter), and touch the
+watchdog on tick_unfreeze() before the resumed CPU is exposed again.
+
+Also snapshots the tick freeze phase, freeze/thaw counts and the
+hardlockup counters with a PMDIAG-tagged warning so a report captured
+through pstore names the state the detector was in.
+
+Ported from linux-thorch a2d50c4e ("debug: snapshot tick freeze state on
+hardlockup") and 8439f91f ("fix: exclude frozen s2idle ticks from
+hardlockup checks"). Tested by inspection only; the vendor kernel tree is
+not part of this repository.
+---
+ include/linux/tick.h      | 8 ++++++++
+ kernel/time/tick-common.c | 33 +++++++++++++++++++++++++++++++++
+ kernel/watchdog.c         | 30 ++++++++++++++++++++++++++++++
+  3 files changed, 71 insertions(+)
+---
+--- a/include/linux/tick.h
++++ b/include/linux/tick.h
+@@ -307,6 +307,14 @@ static inline void tick_nohz_task_switch(void)
+ 		__tick_nohz_task_switch();
+ }
+ 
++#ifdef CONFIG_SUSPEND
++void tick_dump_suspend_state(unsigned int cpu);
++bool tick_cpu_suspended(unsigned int cpu);
++#else
++static inline void tick_dump_suspend_state(unsigned int cpu) { }
++static inline bool tick_cpu_suspended(unsigned int cpu) { return false; }
++#endif
++
+ static inline void tick_nohz_user_enter_prepare(void)
+ {
+ 	if (tick_nohz_full_cpu(smp_processor_id()))
+--- a/kernel/time/tick-common.c
++++ b/kernel/time/tick-common.c
+@@ -506,6 +507,27 @@ void tick_resume(void)
+ static DEFINE_RAW_SPINLOCK(tick_freeze_lock);
+ static DEFINE_WAIT_OVERRIDE_MAP(tick_freeze_map, LD_WAIT_SLEEP);
+ static unsigned int tick_freeze_depth;
++/* Diagnostic snapshots only; never printk while holding tick_freeze_lock.
++ * phase: 0=running, 1=freezing, 2=frozen, 3=unfreezing.
++ */
++static DEFINE_PER_CPU(unsigned int, tick_diag_phase);
++static DEFINE_PER_CPU(unsigned long, tick_diag_freezes);
++static DEFINE_PER_CPU(unsigned long, tick_diag_thaws);
++static DEFINE_PER_CPU(bool, tick_watchdog_suspended);
++
++bool tick_cpu_suspended(unsigned int cpu)
++{
++	return smp_load_acquire(&per_cpu(tick_watchdog_suspended, cpu));
++}
++
++void tick_dump_suspend_state(unsigned int cpu)
++{
++	pr_warn("PMDIAG tick cpu=%u phase=%u freezes=%lu thaws=%lu global_depth=%u system_state=%u\n",
++		cpu, READ_ONCE(per_cpu(tick_diag_phase, cpu)),
++		READ_ONCE(per_cpu(tick_diag_freezes, cpu)),
++		READ_ONCE(per_cpu(tick_diag_thaws, cpu)),
++		READ_ONCE(tick_freeze_depth), READ_ONCE(system_state));
++}
+ 
+ /**
+  * tick_freeze - Suspend the local tick and (possibly) timekeeping.
+@@ -518,6 +535,8 @@ static unsigned int tick_freeze_depth;
+  */
+ void tick_freeze(void)
+ {
++	smp_store_release(this_cpu_ptr(&tick_watchdog_suspended), true);
++	__this_cpu_write(tick_diag_phase, 1);
+ 	raw_spin_lock(&tick_freeze_lock);
+ 
+ 	tick_freeze_depth++;
+@@ -544,6 +563,8 @@ void tick_freeze(void)
+ 		tick_suspend_local();
+ 	}
+ 
++	__this_cpu_inc(tick_diag_freezes);
++	__this_cpu_write(tick_diag_phase, 2);
+ 	raw_spin_unlock(&tick_freeze_lock);
+ }
+ 
+@@ -558,6 +579,7 @@ void tick_freeze(void)
+  */
+ void tick_unfreeze(void)
+ {
++	__this_cpu_write(tick_diag_phase, 3);
+ 	raw_spin_lock(&tick_freeze_lock);
+ 
+ 	if (tick_freeze_depth == num_online_cpus()) {
+@@ -580,6 +602,13 @@ void tick_unfreeze(void)
+ 	}
+ 
+ 	tick_freeze_depth--;
++	__this_cpu_inc(tick_diag_thaws);
++	__this_cpu_write(tick_diag_phase, 0);
++	/* Reset the hardlockup baseline before exposing the resumed local tick.
++	 * The buddy checker owns the counters; touching asks it to reset them.
++	 */
++	touch_nmi_watchdog();
++	smp_store_release(this_cpu_ptr(&tick_watchdog_suspended), false);
+ 
+ 	raw_spin_unlock(&tick_freeze_lock);
+ }
+--- a/kernel/watchdog.c
++++ b/kernel/watchdog.c
+@@ -209,6 +209,14 @@ void watchdog_hardlockup_check(unsigned int cpu, struct pt_regs *regs)
+ 	int hardlockup_all_cpu_backtrace;
+ 	unsigned int this_cpu;
+ 	unsigned long flags;
++	/* s2idle deliberately stops this CPU's timer. A running buddy must not
++	 * interpret that interval as missed watchdog interrupts.
++	 */
++	if (tick_cpu_suspended(cpu)) {
++		watchdog_hardlockup_update_reset(cpu);
++		per_cpu(watchdog_hardlockup_warned, cpu) = false;
++		return;
++	}
+ 
+ 	if (per_cpu(watchdog_hardlockup_touched, cpu)) {
+ 		watchdog_hardlockup_update_reset(cpu);
+@@ -228,6 +236,28 @@ void watchdog_hardlockup_check(unsigned int cpu, struct pt_regs *regs)
+ 		per_cpu(watchdog_hardlockup_warned, cpu) = false;
+ 		return;
+ 	}
++	/* The target may have entered s2idle while we sampled its counter. */
++	if (tick_cpu_suspended(cpu)) {
++		watchdog_hardlockup_update_reset(cpu);
++		return;
++	}
++	/* Capture before sched_ext consumes the first report. No watchdog or
++	 * suspend state is changed; these are best-effort concurrent snapshots.
++	 */
++	pr_warn("PMDIAG hardlock observer=%u target=%u timer=%d saved=%d missed=%d threshold=%u touched=%d warned=%d\n",
++		smp_processor_id(), cpu,
++		atomic_read(&per_cpu(hrtimer_interrupts, cpu)),
++		READ_ONCE(per_cpu(hrtimer_interrupts_saved, cpu)),
++		READ_ONCE(per_cpu(hrtimer_interrupts_missed, cpu)),
++		watchdog_hardlockup_miss_thresh,
++		READ_ONCE(per_cpu(watchdog_hardlockup_touched, cpu)),
++		READ_ONCE(per_cpu(watchdog_hardlockup_warned, cpu)));
++	{
++		unsigned int diag_cpu;
++
++		for_each_online_cpu(diag_cpu)
++			tick_dump_suspend_state(diag_cpu);
++	}
+ 
+ #ifdef CONFIG_SYSFS
+ 	++hardlockup_count;
